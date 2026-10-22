@@ -1052,20 +1052,27 @@ transcribe_status run(transcribe_session *          session,
 
     // Init KV cache.
     {
-        if (cc->kv_cache.buffer != nullptr && cc->kv_cache.T_enc != T_enc) {
+        // Decoder self-KV ceiling: the model's trained dec_max_position,
+        // optionally lowered (never raised) by the caller's n_ctx knob.
+        // With the default knob (0) this is exactly dec_max_position, so
+        // in-spec decode is unchanged.
+        const int n_ctx = canary_context_ceiling(cc->n_ctx, cm->hparams);
+        // The cross slab only grows: every graph views it with this run's
+        // T_enc (layer il at il * T_enc * hidden), so a slab sized for an
+        // earlier, longer input serves a shorter one unchanged. Reallocating
+        // per length would also re-clear the much larger self slab each run.
+        if (cc->kv_cache.buffer != nullptr &&
+            (cc->kv_cache.T_enc < T_enc || cc->kv_cache.n_batch != 1 || cc->kv_cache.n_ctx != n_ctx)) {
             cc->kv_cache.free();
         }
         if (cc->kv_cache.buffer == nullptr) {
-            // Decoder self-KV ceiling: the model's trained dec_max_position,
-            // optionally lowered (never raised) by the caller's n_ctx knob.
-            // With the default knob (0) this is exactly dec_max_position, so
-            // in-spec decode is unchanged.
-            const int n_ctx      = canary_context_ceiling(cc->n_ctx, cm->hparams);
-            ggml_type cache_type = resolved_kv;
+            constexpr int kCrossGrain = 64;  // encoder frames, about 5 s of audio
+            const int     T_enc_cap   = (T_enc + kCrossGrain - 1) / kCrossGrain * kCrossGrain;
+            ggml_type     cache_type  = resolved_kv;
             if (cache_type == GGML_TYPE_COUNT) {
                 cache_type = GGML_TYPE_F16;
             }
-            if (!kv_cache_init(cc->kv_cache, cm->plan.primary, n_ctx, T_enc, cm->hparams.dec_d_model,
+            if (!kv_cache_init(cc->kv_cache, cm->plan.primary, n_ctx, T_enc_cap, cm->hparams.dec_d_model,
                                cm->hparams.dec_n_layers, cache_type)) {
                 transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                     "canary run: KV cache allocation failed (n_ctx=%d, T_enc=%d, "
