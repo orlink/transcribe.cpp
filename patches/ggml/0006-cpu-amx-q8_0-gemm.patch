@@ -1,0 +1,223 @@
+diff --git a/src/ggml-cpu/amx/mmq.cpp b/src/ggml-cpu/amx/mmq.cpp
+index 9f3a744..2239e07 100644
+--- a/src/ggml-cpu/amx/mmq.cpp
++++ b/src/ggml-cpu/amx/mmq.cpp
+@@ -12,6 +12,7 @@
+ #include "ggml-quants.h"
+ #include <algorithm>
+ #include <type_traits>
++#include <vector>
+ 
+ #if defined(__gnu_linux__)
+ #include <sys/syscall.h>
+@@ -2307,6 +2308,188 @@ inline int64_t ggml_batch_offset(const ggml_tensor * t, int64_t batch_idx, int64
+     return i3 * t->nb[3] + i2 * t->nb[2];
+ }
+ 
++namespace {
++
++// Q8_0 x Q8_0 with M > 1: per output, C = fma(float(sumi_k), d_B * d_A, C) over the K blocks in order,
++// the same operations as tinygemm_kernel_amx + acc_C, so the result is bit-identical. Differences:
++//   - A is quantized once into 16-row tiles (zero rows past M) with its scales as float, so no
++//     per-block unpack or fp16 conversion is left in the inner loop;
++//   - the C tiles accumulate over K instead of being zeroed per block, and each block's sums are the
++//     difference of two stored running totals (exact in int32: a block sum is at most
++//     32 * 127 * 127, so K up to about 130k cannot overflow); this removes the zero -> dpbssd -> store
++//     -> zero chain per tile;
++//   - the AVX512 work for block k runs while the tiles of block k + 1 are computed (three buffers);
++//   - threads split the 32-column panels, and each thread runs every row block on a panel while it
++//     is in cache, so a weight panel is read from memory once.
++// GGML_AMX_Q8_0_LEGACY=1 uses the original kernel.
++constexpr int AMX_Q8_A_TILE = TILE_M * TILE_K;  // bytes of one packed 16 x 32 A tile
++
++size_t amx_q8_0_packed_a_size(int M, int K) {
++    const int MT = (M + TILE_M - 1) / TILE_M;
++    const int KB = K / QK8_0;
++    return (size_t) MT * KB * AMX_Q8_A_TILE + (size_t) MT * TILE_M * KB * sizeof(float);
++}
++
++// quantize row m of A into the packed tile layout: tile (m / 16, kb) at ((m / 16) * KB + kb) * 512,
++// row m % 16 at 32 bytes each; scales as float at [m * KB + kb] after all tiles
++void amx_q8_0_pack_a_row(const float * x, int8_t * packed, float * scales, block_q8_0 * tmp, int m, int K) {
++    const int KB = K / QK8_0;
++    const int mt = m / TILE_M;
++    const int mr = m % TILE_M;
++    if (x != nullptr) {
++        quantize_row_q8_0(x, tmp, K);
++    }
++    for (int kb = 0; kb < KB; ++kb) {
++        int8_t * dst = packed + ((size_t) mt * KB + kb) * AMX_Q8_A_TILE + mr * TILE_K;
++        if (x != nullptr) {
++            _mm256_storeu_si256((__m256i *) dst, _mm256_loadu_si256((const __m256i *) tmp[kb].qs));
++            scales[(size_t) m * KB + kb] = GGML_CPU_FP16_TO_FP32(tmp[kb].d);
++        } else {
++            _mm256_storeu_si256((__m256i *) dst, _mm256_setzero_si256());
++            scales[(size_t) m * KB + kb] = 0.0f;
++        }
++    }
++}
++
++// C (rows m0 .. m0 + nr, 16 columns) for block kb from the running totals cur - pre
++inline void amx_q8_0_acc_block(float * RESTRICT C, int ldc, const int32_t * RESTRICT cur, const int32_t * RESTRICT pre,
++                               const float * RESTRICT a_scales, int KB, int kb, const char * RESTRICT b_tile, int nr) {
++    const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (b_tile + TILE_N * TILE_K)));
++    for (int m = 0; m < nr; ++m) {
++        __m512i vi = _mm512_loadu_si512(cur + m * TILE_N);
++        if (pre != nullptr) {
++            vi = _mm512_sub_epi32(vi, _mm512_loadu_si512(pre + m * TILE_N));
++        }
++        const __m512 vd1   = _mm512_set1_ps(a_scales[m * KB + kb]);
++        const __m512 vtile = _mm512_cvtepi32_ps(vi);
++        __m512       vsum  = kb > 0 ? _mm512_loadu_ps(C + m * ldc) : _mm512_set1_ps(0.f);
++        vsum               = _mm512_fmadd_ps(vtile, _mm512_mul_ps(vd0, vd1), vsum);
++        _mm512_storeu_ps(C + m * ldc, vsum);
++    }
++}
++
++// one 32-column panel (two B tiles) times rows [mt * 16, mt * 16 + 32) of A (one or two A tiles)
++void amx_q8_0_panel(int nr0, int nr1, int KB, const int8_t * RESTRICT A0, const int8_t * RESTRICT A1,
++                    const float * RESTRICT s0, const float * RESTRICT s1, const char * RESTRICT B0,
++                    const char * RESTRICT B1, int tile_size, float * RESTRICT C, int ldc) {
++    alignas(64) int32_t buf[3][4][TILE_M * TILE_N];
++    // C is accumulated in a contiguous block and copied out at the end: dst rows are usually a
++    // multiple of 4 KB apart, so its rows of one panel share a few L1 sets and evict each other
++    constexpr int ldb = 2 * TILE_N;
++    alignas(64) float cb[2 * TILE_M * ldb];
++    const bool two = nr1 > 0;
++
++    _tile_zero(TMM4);
++    _tile_zero(TMM6);
++    if (two) {
++        _tile_zero(TMM5);
++        _tile_zero(TMM7);
++    }
++    auto consume = [&](int kb) {
++        int32_t(*cur)[TILE_M * TILE_N] = buf[kb % 3];
++        int32_t(*pre)[TILE_M * TILE_N] = kb > 0 ? buf[(kb - 1) % 3] : nullptr;
++        const char * bt0 = B0 + (size_t) kb * tile_size;
++        const char * bt1 = B1 + (size_t) kb * tile_size;
++        amx_q8_0_acc_block(cb, ldb, cur[0], pre ? pre[0] : nullptr, s0, KB, kb, bt0, nr0);
++        amx_q8_0_acc_block(cb + TILE_N, ldb, cur[2], pre ? pre[2] : nullptr, s0, KB, kb, bt1, nr0);
++        if (two) {
++            amx_q8_0_acc_block(cb + TILE_M * ldb, ldb, cur[1], pre ? pre[1] : nullptr, s1, KB, kb, bt0, nr1);
++            amx_q8_0_acc_block(cb + TILE_M * ldb + TILE_N, ldb, cur[3], pre ? pre[3] : nullptr, s1, KB, kb, bt1, nr1);
++        }
++    };
++    for (int kb = 0; kb < KB; ++kb) {
++        _tile_loadd(TMM0, B0 + (size_t) kb * tile_size, TILE_N * VNNI_BLK);
++        _tile_loadd(TMM1, B1 + (size_t) kb * tile_size, TILE_N * VNNI_BLK);
++        _tile_loadd(TMM2, A0 + (size_t) kb * AMX_Q8_A_TILE, TILE_K);
++        _tile_dpbssd(TMM4, TMM2, TMM0);
++        _tile_dpbssd(TMM6, TMM2, TMM1);
++        if (two) {
++            _tile_loadd(TMM3, A1 + (size_t) kb * AMX_Q8_A_TILE, TILE_K);
++            _tile_dpbssd(TMM5, TMM3, TMM0);
++            _tile_dpbssd(TMM7, TMM3, TMM1);
++        }
++        int32_t(*cur)[TILE_M * TILE_N] = buf[kb % 3];
++        _tile_stored(TMM4, cur[0], TILE_N * sizeof(int32_t));
++        _tile_stored(TMM6, cur[2], TILE_N * sizeof(int32_t));
++        if (two) {
++            _tile_stored(TMM5, cur[1], TILE_N * sizeof(int32_t));
++            _tile_stored(TMM7, cur[3], TILE_N * sizeof(int32_t));
++        }
++        if (kb > 0) {
++            consume(kb - 1);
++        }
++    }
++    consume(KB - 1);
++    for (int m = 0; m < nr0 + nr1; ++m) {
++        _mm512_storeu_ps(C + m * ldc, _mm512_load_ps(cb + m * ldb));
++        _mm512_storeu_ps(C + m * ldc + TILE_N, _mm512_load_ps(cb + m * ldb + TILE_N));
++    }
++}
++
++void amx_q8_0_mul_mat(const ggml_compute_params * params, const ggml_tensor * src0, const ggml_tensor * src1,
++                      ggml_tensor * dst) {
++    const int     M       = dst->ne[1];
++    const int     N       = dst->ne[0];
++    const int     K       = src0->ne[0];
++    const int     KB      = K / QK8_0;
++    const int     MT      = (M + TILE_M - 1) / TILE_M;
++    const int     ldc     = dst->nb[1] / dst->nb[0];
++    const int64_t ne2     = dst->ne[2];
++    const int64_t n_batch = ne2 * dst->ne[3];
++    const int     tile_size = get_tile_size<block_q8_0>();
++    const size_t  a_size    = amx_q8_0_packed_a_size(M, K);
++
++    // per batch: packed A tiles, then the A scales
++    char * wdata = (char *) params->wdata;
++    if (params->wsize < n_batch * a_size) {
++        GGML_ABORT("insufficient work space size");
++    }
++    static thread_local std::vector<block_q8_0> tmp_row;
++    tmp_row.resize(KB);
++    block_q8_0 * tmp = tmp_row.data();
++
++    parallel_for_ggml(params, n_batch * MT * TILE_M, [&](int begin, int end) {
++        for (int idx = begin; idx < end; ++idx) {
++            const int64_t b = idx / (MT * TILE_M);
++            const int     m = idx % (MT * TILE_M);
++            int8_t *      packed = (int8_t *) (wdata + b * a_size);
++            float *       scales = (float *) (wdata + b * a_size + (size_t) MT * KB * AMX_Q8_A_TILE);
++            const float * x = m < M ? (const float *) ((const char *) src1->data + ggml_batch_offset(src1, b, ne2)) + (size_t) m * K
++                                    : nullptr;
++            amx_q8_0_pack_a_row(x, packed, scales, tmp, m, K);
++        }
++    });
++    ggml_barrier(params->threadpool);
++
++    const int NB = N / (2 * TILE_N);
++    parallel_for_ggml(params, n_batch * NB, [&](int begin, int end) {
++        ggml_tile_config_init();
++        for (int i = begin; i < end; ++i) {
++            const int64_t b      = i / NB;
++            const int     nb     = i % NB;
++            const int8_t * packed = (const int8_t *) (wdata + b * a_size);
++            const float *  scales = (const float *) (wdata + b * a_size + (size_t) MT * KB * AMX_Q8_A_TILE);
++            const char *   B0 = (const char *) src0->data + ggml_batch_offset(src0, b, ne2) + PACKED_INDEX(nb * 2, 0, KB, tile_size);
++            const char *   B1 = B0 + (size_t) KB * tile_size;
++            float *        Cb = (float *) ((char *) dst->data + ggml_batch_offset(dst, b, ne2)) + nb * 2 * TILE_N;
++            for (int mt = 0; mt < MT; mt += 2) {
++                const int nr0 = std::min(TILE_M, M - mt * TILE_M);
++                const int nr1 = mt + 1 < MT ? std::min(TILE_M, M - (mt + 1) * TILE_M) : 0;
++                amx_q8_0_panel(nr0, nr1, KB, packed + (size_t) mt * KB * AMX_Q8_A_TILE,
++                               packed + (size_t) (mt + 1) * KB * AMX_Q8_A_TILE, scales + (size_t) mt * TILE_M * KB,
++                               scales + (size_t) (mt + 1) * TILE_M * KB, B0, B1, tile_size, Cb + (size_t) mt * TILE_M * ldc, ldc);
++            }
++        }
++    });
++}
++
++bool amx_q8_0_use_new(const ggml_tensor * src0, int M) {
++    static const bool legacy = getenv("GGML_AMX_Q8_0_LEGACY") != nullptr;
++    return !legacy && src0->type == GGML_TYPE_Q8_0 && M > 1 && src0->ne[1] % (2 * TILE_N) == 0;
++}
++
++} // anonymous namespace
++
+ size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst) {
+     struct ggml_tensor * src0 = dst->src[0];
+ 
+@@ -2327,6 +2510,9 @@ size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst) {
+         const size_t row_size_A = K / blck_size * sizeof(vec_dot_type);
+         desired_wsize = n_batch * M * row_size_A;
+     });
++    if (TYPE == GGML_TYPE_Q8_0 && M > 1) {
++        desired_wsize = std::max(desired_wsize, n_batch * amx_q8_0_packed_a_size(M, K));
++    }
+ 
+     return desired_wsize;
+ }
+@@ -2401,6 +2587,11 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
+         return;
+     }
+ 
++    if (amx_q8_0_use_new(src0, M)) {
++        amx_q8_0_mul_mat(params, src0, src1, dst);
++        return;
++    }
++
+     // pointer to work space, used convert A from float to quantized type
+     void * wdata = params->wdata;
+ 
