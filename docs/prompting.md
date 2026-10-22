@@ -35,3 +35,16 @@ note under [`models/`](models/).
 - A feature bit covers plain transcription. Under another task or output mode
   a model may ignore `vocabulary` or `prompt` with a WARN; its model doc says
   when.
+
+## Draft
+
+`draft` (`--draft-text`, feature bit `DRAFT`) is text the caller expects to be
+close to the transcript, such as a first-pass recognizer's output for the same
+audio. It is not a prompt: the decoder verifies several draft tokens per pass
+and keeps the ones its own greedy choice agrees with, so the output is the
+output without a draft and only the number of decoder passes changes.
+`spec_k_drafts` caps the draft tokens per pass.
+
+Canary supports it on CPU (measured on canary-1b-v2), where batched rows compute exactly
+like one-token steps; the default is 15 draft tokens per pass. Other families,
+batches and streams ignore it.

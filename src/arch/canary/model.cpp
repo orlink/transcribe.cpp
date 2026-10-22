@@ -17,6 +17,7 @@
 #include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
 #include "transcribe-decode-budget.h"
+#include "transcribe-draft.h"
 #include "transcribe-env.h"
 #include "transcribe-flash-policy.h"
 #include "transcribe-load-common.h"
@@ -353,6 +354,11 @@ transcribe_status promote_conv_pw_to_f32_on_cpu(CanaryModel & m) {
                                                           &m.conv_pw_f32_buffer);
 }
 
+bool canary_primary_is_gpu(const transcribe::BackendPlan & plan) {
+    return plan.primary_kind != transcribe::BackendKind::Cpu && plan.primary_kind != transcribe::BackendKind::Accel &&
+           plan.primary_kind != transcribe::BackendKind::Unknown;
+}
+
 // Weights the graphs use only as the first operand of ggml_mul_mat (see
 // load_common::MulMatWeights). Not the token / position embeddings
 // (ggml_get_rows), the convolution kernels, or the 1x1 conv weights, which
@@ -537,6 +543,8 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
 
     m->backend         = ggml_backend_name(m->plan.primary);
     m->primary_backend = m->plan.primary;
+    // Draft verification is wired for CPU primaries (see run()).
+    transcribe::set_feature(m.get(), TRANSCRIBE_FEATURE_DRAFT, !canary_primary_is_gpu(m->plan));
 
     const transcribe::load_common::MulMatWeights mul_mat_weights = canary_mul_mat_weights(m->weights);
     if (const transcribe_status st = transcribe::load_common::load_weights(
@@ -793,6 +801,260 @@ bool translation_pair_allowed(const CanaryHParams & hp, const char * src, const 
         }
     }
     return false;
+}
+
+// Draft verification bounds. ggml-cpu's flash attention takes a tiled kernel
+// from 64 query rows on, and a split-KV kernel for one query row over 512 or
+// more keys. Inside these bounds each row of a verification pass is computed
+// the way the one-token step computes it, so the drafted decode emits the
+// same tokens; beyond them the decode falls back to one-token steps.
+constexpr int k_draft_max_rows    = 63;
+constexpr int k_draft_max_kv      = 511;
+// Draft tokens per verification pass unless spec_k_drafts says otherwise
+// (16 rows per pass; measured best on AMX CPUs).
+constexpr int k_draft_default_len = 15;
+
+// Draft text as decoder tokens, end-of-text appended: tokenized like the
+// transcript prefix (see encode_canary2_prefix). Empty on failure.
+std::vector<int32_t> encode_canary_draft(const CanaryModel & cm, const char * draft, const char * tgt_lang) {
+    std::vector<int32_t> ids;
+    int                  lo = 0, hi = -1;
+    if (!cm.hparams.tokenizer_single_sp) {
+        lo = hi = -1;
+        for (size_t i = 0; i < cm.hparams.tok_lang_codes.size(); ++i) {
+            if (cm.hparams.tok_lang_codes[i] == tgt_lang) {
+                lo = cm.hparams.tok_lang_offsets[i];
+                hi = lo + cm.hparams.tok_lang_sizes[i];
+            }
+        }
+        if (lo < 0) {
+            return ids;
+        }
+    }
+    if (cm.tok.encode_sentencepiece_bpe(draft, ids, lo, hi, !cm.hparams.tokenizer_single_sp) != TRANSCRIBE_OK ||
+        ids.empty()) {
+        ids.clear();
+        return ids;
+    }
+    ids.push_back(cm.hparams.eos_token_id);
+    return ids;
+}
+
+// One KV-cached decoder pass over ids[0, n) at positions [n_past, n_past + n):
+// writes their self-KV rows and stores the argmax after each of the last
+// n_out positions in out[0, n_out).
+transcribe_status canary_decoder_pass(CanarySession *     cc,
+                                      const CanaryModel * cm,
+                                      const int32_t *     ids,
+                                      int                 n,
+                                      int                 n_past,
+                                      int                 n_out,
+                                      int                 T_enc,
+                                      int32_t *           out) {
+    if (cc->compute_ctx != nullptr) {
+        ggml_free(cc->compute_ctx);
+        cc->compute_ctx = nullptr;
+    }
+    cc->encoder_out = nullptr;
+    ggml_init_params ip{};
+    ip.mem_size     = 4 * 1024 * 1024;
+    ip.no_alloc     = true;
+    cc->compute_ctx = ggml_init(ip);
+    if (cc->compute_ctx == nullptr) {
+        return TRANSCRIBE_ERR_OOM;
+    }
+
+    DecoderBuild db = build_decoder_graph_kv(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, n, n_past, T_enc,
+                                             /*skip_log_softmax=*/true, cc->decoder_use_flash, n_out);
+    if (db.graph == nullptr || db.argmax_out == nullptr) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: decoder pass graph build failed");
+        return TRANSCRIBE_ERR_GGUF;
+    }
+    ggml_backend_sched_reset(cc->sched);
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, db.graph, "canary")) {
+        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                            "canary run: decoder pass graph allocation failed — out of memory.");
+        return TRANSCRIBE_ERR_OOM;
+    }
+
+    std::vector<int32_t> pos(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        pos[static_cast<size_t>(i)] = n_past + i;
+    }
+    ggml_backend_tensor_set(db.token_ids_in, ids, 0, static_cast<size_t>(n) * sizeof(int32_t));
+    ggml_backend_tensor_set(db.pos_ids_in, pos.data(), 0, pos.size() * sizeof(int32_t));
+    if (n > 1) {
+        ggml_tensor * mask_in = nullptr;
+        for (ggml_tensor * t = ggml_get_first_tensor(cc->compute_ctx); t != nullptr;
+             t               = ggml_get_next_tensor(cc->compute_ctx, t)) {
+            if (std::strcmp(t->name, "dec.causal_mask") == 0 && t->type == GGML_TYPE_F32) {
+                mask_in = t;
+                break;
+            }
+        }
+        if (mask_in == nullptr) {
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        const int          n_kv = n_past + n;
+        std::vector<float> mask(static_cast<size_t>(n_kv) * n);
+        for (int q = 0; q < n; ++q) {
+            for (int k = 0; k < n_kv; ++k) {
+                mask[static_cast<size_t>(q) * n_kv + k] = (k <= n_past + q) ? 0.0f : -1e9f;
+            }
+        }
+        ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(float));
+    }
+
+    if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, db.graph); gs != GGML_STATUS_SUCCESS) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: decoder pass compute failed (%d)", static_cast<int>(gs));
+        return TRANSCRIBE_ERR_BACKEND;
+    }
+    ggml_backend_tensor_get(db.argmax_out, out, 0, static_cast<size_t>(n_out) * sizeof(int32_t));
+    return TRANSCRIBE_OK;
+}
+
+struct DraftStats {
+    int passes   = 0;  // decoder passes, the prompt pass included
+    int drafted  = 0;  // draft tokens fed to the decoder
+    int accepted = 0;  // draft tokens the decoder's argmax agreed with
+};
+
+// Greedy decode that verifies draft tokens in batched passes, the prompt pass
+// included. Emits the tokens of the one-token-per-pass loop, with the same
+// end-of-text, budget, context and repetition stops.
+transcribe_status canary_decode_drafted(CanarySession *              cc,
+                                        const CanaryModel *          cm,
+                                        const std::vector<int32_t> & prompt_ids,
+                                        int                          T_enc,
+                                        int                          max_tokens,
+                                        int                          k_max,
+                                        transcribe::DraftCursor &    cursor,
+                                        std::vector<int> &           generated_ids,
+                                        int &                        next_token,
+                                        bool &                       repeating,
+                                        DraftStats &                 stats) {
+    const int eos_id     = cm->hparams.eos_token_id;
+    const int n_ctx      = cc->kv_cache.n_ctx;
+    const int prompt_len = static_cast<int>(prompt_ids.size());
+
+    // Reserve the largest passes up front (a one-token step at the end of
+    // the context, the widest verification pass) so later passes do not
+    // grow the scheduler's buffers.
+    {
+        const int n_rows  = std::min(std::min(std::max(prompt_len, k_max + 1), k_draft_max_rows), n_ctx);
+        const int rows[2] = { 1, n_rows };
+        const int past[2] = { n_ctx - 1, std::max(0, std::min(n_ctx, k_draft_max_kv) - n_rows) };
+        for (int i = 0; i < 2; ++i) {
+            if (cc->compute_ctx != nullptr) {
+                ggml_free(cc->compute_ctx);
+            }
+            cc->encoder_out = nullptr;
+            ggml_init_params ip{};
+            ip.mem_size     = 4 * 1024 * 1024;
+            ip.no_alloc     = true;
+            cc->compute_ctx = ggml_init(ip);
+            if (cc->compute_ctx == nullptr) {
+                return TRANSCRIBE_ERR_OOM;
+            }
+            DecoderBuild r =
+                build_decoder_graph_kv(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, rows[i], past[i], T_enc,
+                                       /*skip_log_softmax=*/true, cc->decoder_use_flash, std::min(rows[i], 1 + k_max));
+            if (r.graph != nullptr) {
+                ggml_backend_sched_reserve(cc->sched, r.graph);
+            }
+        }
+    }
+
+    std::vector<int32_t> in;
+    std::vector<int32_t> out;
+    int                  n_past  = 0;
+    int                  n_steps = 0;  // argmax outputs consumed, the prompt pass's included
+    bool                 first   = true;
+    next_token                   = eos_id;
+
+    while (true) {
+        if (cc->poll_abort()) {
+            return TRANSCRIBE_ERR_ABORTED;
+        }
+        if (!first) {
+            if (n_steps >= max_tokens || next_token == eos_id) {
+                break;
+            }
+            if (n_past + 1 > n_ctx) {
+                transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_WARN, "canary run: KV cache full at n_past=%d", n_past);
+                break;
+            }
+        }
+
+        in.clear();
+        if (first) {
+            in.assign(prompt_ids.begin(), prompt_ids.end());
+        } else {
+            in.push_back(next_token);
+        }
+        const int n_head = static_cast<int>(in.size());
+
+        // At most k_max + 1 rows per pass; the prompt pass drafts fewer.
+        int k = k_max + 1 - n_head;
+        k     = std::min(k, max_tokens - n_steps - 1);
+        k     = std::min(k, n_ctx - n_past - n_head);
+        k     = std::min(k, k_draft_max_rows - n_head);
+        k     = std::min(k, k_draft_max_kv - n_past - n_head);
+        if (T_enc > k_draft_max_kv) {
+            k = 0;
+        }
+        const int32_t * draft = nullptr;
+        k                     = cursor.propose(k, &draft);
+        in.insert(in.end(), draft, draft + k);
+
+        const int n_out = k + 1;
+        out.resize(static_cast<size_t>(n_out));
+        if (const transcribe_status st =
+                canary_decoder_pass(cc, cm, in.data(), static_cast<int>(in.size()), n_past, n_out, T_enc, out.data());
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        stats.passes += 1;
+        stats.drafted += k;
+
+        // Output j follows input row n_head - 1 + j; it counts only while
+        // every draft token before it was the decoder's own choice.
+        const int n_past0 = n_past;
+        bool      stop    = false;
+
+        for (int j = 0; j < n_out; ++j) {
+            const int tok = out[static_cast<size_t>(j)];
+            n_past        = n_past0 + n_head + j;
+            n_steps += 1;
+            next_token = tok;
+            if (tok == eos_id) {
+                stats.accepted += (j < k && draft[j] == tok) ? 1 : 0;
+                stop = true;
+                break;
+            }
+            generated_ids.push_back(tok);
+            if (transcribe::stop_on_repetition(generated_ids, "canary run")) {
+                cc->mark_repetition_stop();
+                repeating = true;
+                stop      = true;
+                break;
+            }
+            cursor.push(tok);
+            if (j < k) {
+                if (tok != draft[j]) {
+                    break;
+                }
+                stats.accepted += 1;
+            }
+        }
+        cc->kv_cache.n    = n_past;
+        cc->kv_cache.head = n_past;
+        first             = false;
+        if (stop) {
+            break;
+        }
+    }
+    return TRANSCRIBE_OK;
 }
 
 transcribe_status run(transcribe_session *          session,
@@ -1150,70 +1412,90 @@ transcribe_status run(transcribe_session *          session,
         // When debug-dumping, we need full softmax'd logits for the
         // pre-head dump pipeline (matches cohere's pattern). Otherwise
         // skip log_softmax and read a GPU argmax over the last position.
-        const bool   prompt_skip_softmax = !transcribe::debug::enabled();
-        DecoderBuild db = build_decoder_graph_kv(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, prompt_len,
-                                                 /*n_past=*/0, T_enc,
-                                                 /*skip_log_softmax=*/prompt_skip_softmax, cc->decoder_use_flash);
-        if (db.out == nullptr || db.graph == nullptr) {
-            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: build_decoder_graph_kv (prompt) failed");
-            return TRANSCRIBE_ERR_GGUF;
-        }
+        const bool prompt_skip_softmax = !transcribe::debug::enabled();
 
-        ggml_backend_sched_reset(cc->sched);
-        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, db.graph, "canary")) {
-            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                                "canary run: decoder-prompt graph allocation failed — "
-                                "out of memory.");
-            return TRANSCRIBE_ERR_OOM;
+        // A caller draft is verified on CPU primaries, where batched rows
+        // compute exactly like one-token steps (see k_draft_max_rows). Its
+        // decode runs the prompt pass itself, with the first draft tokens.
+        std::vector<int32_t> draft_ids;
+        int                  draft_len = k_draft_default_len;
+        if (params != nullptr && params->spec_k_drafts >= 0) {
+            draft_len = params->spec_k_drafts;
         }
-
-        ggml_backend_tensor_set(db.token_ids_in, prompt_ids.data(), 0, prompt_ids.size() * sizeof(int32_t));
-        std::vector<int32_t> pos_ids(prompt_len);
-        for (int i = 0; i < prompt_len; ++i) {
-            pos_ids[i] = i;
+        if (params != nullptr && params->draft != nullptr && draft_len > 0 && prompt_skip_softmax &&
+            cc->decoder_use_flash && !canary_primary_is_gpu(cm->plan)) {
+            draft_ids = encode_canary_draft(*cm, params->draft, tgt_lang);
         }
-        ggml_backend_tensor_set(db.pos_ids_in, pos_ids.data(), 0, pos_ids.size() * sizeof(int32_t));
+        const bool use_draft = !draft_ids.empty();
 
-        if (prompt_len > 1) {
-            ggml_tensor * mask_input = find_mask_input();
-            if (mask_input != nullptr) {
-                const int          n_kv = prompt_len;
-                std::vector<float> mask_data(static_cast<size_t>(n_kv) * prompt_len);
-                for (int q = 0; q < prompt_len; ++q) {
-                    for (int k = 0; k < n_kv; ++k) {
-                        mask_data[static_cast<size_t>(q) * n_kv + k] = (k <= q) ? 0.0f : -1e9f;
+        DecoderBuild db{};
+        if (!use_draft) {
+            db = build_decoder_graph_kv(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, prompt_len,
+                                        /*n_past=*/0, T_enc,
+                                        /*skip_log_softmax=*/prompt_skip_softmax, cc->decoder_use_flash);
+            if (db.out == nullptr || db.graph == nullptr) {
+                log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: build_decoder_graph_kv (prompt) failed");
+                return TRANSCRIBE_ERR_GGUF;
+            }
+
+            ggml_backend_sched_reset(cc->sched);
+            if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, db.graph, "canary")) {
+                transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                                    "canary run: decoder-prompt graph allocation failed — "
+                                    "out of memory.");
+                return TRANSCRIBE_ERR_OOM;
+            }
+
+            ggml_backend_tensor_set(db.token_ids_in, prompt_ids.data(), 0, prompt_ids.size() * sizeof(int32_t));
+            std::vector<int32_t> pos_ids(prompt_len);
+            for (int i = 0; i < prompt_len; ++i) {
+                pos_ids[i] = i;
+            }
+            ggml_backend_tensor_set(db.pos_ids_in, pos_ids.data(), 0, pos_ids.size() * sizeof(int32_t));
+
+            if (prompt_len > 1) {
+                ggml_tensor * mask_input = find_mask_input();
+                if (mask_input != nullptr) {
+                    const int          n_kv = prompt_len;
+                    std::vector<float> mask_data(static_cast<size_t>(n_kv) * prompt_len);
+                    for (int q = 0; q < prompt_len; ++q) {
+                        for (int k = 0; k < n_kv; ++k) {
+                            mask_data[static_cast<size_t>(q) * n_kv + k] = (k <= q) ? 0.0f : -1e9f;
+                        }
                     }
+                    ggml_backend_tensor_set(mask_input, mask_data.data(), 0, mask_data.size() * sizeof(float));
                 }
-                ggml_backend_tensor_set(mask_input, mask_data.data(), 0, mask_data.size() * sizeof(float));
             }
-        }
 
-        if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, db.graph); gs != GGML_STATUS_SUCCESS) {
-            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: decoder prompt compute failed (%d)", static_cast<int>(gs));
-            return TRANSCRIBE_ERR_BACKEND;
-        }
-
-        // Per-sublayer dumps at layers {0, n_layers/2, n_layers-1}.
-        for (int i = 0; i < cm->hparams.dec_n_layers; ++i) {
-            const bool dump_this =
-                (i == 0) || (i == cm->hparams.dec_n_layers / 2) || (i == cm->hparams.dec_n_layers - 1);
-            if (!dump_this || i >= 64) {
-                continue;
+            if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, db.graph);
+                gs != GGML_STATUS_SUCCESS) {
+                log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: decoder prompt compute failed (%d)",
+                        static_cast<int>(gs));
+                return TRANSCRIBE_ERR_BACKEND;
             }
-            char bname[64], stage[64];
-            std::snprintf(bname, sizeof(bname), "dec.layer.%d.self_attn.out", i);
-            std::snprintf(stage, sizeof(stage), "decoder.layer%d.self_attn", i);
-            try_dump(bname, db.dumps.sub_self[i], stage);
-            std::snprintf(bname, sizeof(bname), "dec.layer.%d.cross_attn.out", i);
-            std::snprintf(stage, sizeof(stage), "decoder.layer%d.cross_attn", i);
-            try_dump(bname, db.dumps.sub_cross[i], stage);
-            std::snprintf(bname, sizeof(bname), "dec.layer.%d.ffn.out", i);
-            std::snprintf(stage, sizeof(stage), "decoder.layer%d.ffn", i);
-            try_dump(bname, db.dumps.sub_ffn[i], stage);
-        }
 
-        cc->kv_cache.n    = prompt_len;
-        cc->kv_cache.head = prompt_len;
+            // Per-sublayer dumps at layers {0, n_layers/2, n_layers-1}.
+            for (int i = 0; i < cm->hparams.dec_n_layers; ++i) {
+                const bool dump_this =
+                    (i == 0) || (i == cm->hparams.dec_n_layers / 2) || (i == cm->hparams.dec_n_layers - 1);
+                if (!dump_this || i >= 64) {
+                    continue;
+                }
+                char bname[64], stage[64];
+                std::snprintf(bname, sizeof(bname), "dec.layer.%d.self_attn.out", i);
+                std::snprintf(stage, sizeof(stage), "decoder.layer%d.self_attn", i);
+                try_dump(bname, db.dumps.sub_self[i], stage);
+                std::snprintf(bname, sizeof(bname), "dec.layer.%d.cross_attn.out", i);
+                std::snprintf(stage, sizeof(stage), "decoder.layer%d.cross_attn", i);
+                try_dump(bname, db.dumps.sub_cross[i], stage);
+                std::snprintf(bname, sizeof(bname), "dec.layer.%d.ffn.out", i);
+                std::snprintf(stage, sizeof(stage), "decoder.layer%d.ffn", i);
+                try_dump(bname, db.dumps.sub_ffn[i], stage);
+            }
+
+            cc->kv_cache.n    = prompt_len;
+            cc->kv_cache.head = prompt_len;
+        }
 
         cc->clear_result();
 
@@ -1223,7 +1505,9 @@ transcribe_status run(transcribe_session *          session,
                                            k_gen_reserve, prompt_len, cc->kv_cache.n_ctx);
 
         int next_token = 0;
-        if (prompt_skip_softmax && db.argmax_out != nullptr) {
+        if (use_draft) {
+            // Set by the drafted decode below.
+        } else if (prompt_skip_softmax && db.argmax_out != nullptr) {
             int32_t argmax_id = 0;
             ggml_backend_tensor_get(db.argmax_out, &argmax_id, 0, sizeof(int32_t));
             next_token = argmax_id;
@@ -1242,7 +1526,7 @@ transcribe_status run(transcribe_session *          session,
         }
 
         std::vector<int> generated_ids;
-        if (next_token != eos_id) {
+        if (!use_draft && next_token != eos_id) {
             generated_ids.push_back(next_token);
         }
 
@@ -1321,7 +1605,22 @@ transcribe_status run(transcribe_session *          session,
                                     cm->plan.primary_kind != transcribe::BackendKind::Unknown;
         bool       repeating      = false;
 
-        if (primary_is_gpu) {
+        if (use_draft) {
+            const int               n_draft = static_cast<int>(draft_ids.size());
+            transcribe::DraftCursor cursor;
+            cursor.reset(std::move(draft_ids));
+            DraftStats stats;
+            if (const transcribe_status st = canary_decode_drafted(cc, cm, prompt_ids, T_enc, max_tokens, draft_len,
+                                                                   cursor, generated_ids, next_token, repeating, stats);
+                st != TRANSCRIBE_OK) {
+                commit_result();
+                return st;
+            }
+            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
+                                "canary draft: draft_tokens=%d out_tokens=%d passes=%d drafted=%d accepted=%d", n_draft,
+                                static_cast<int>(generated_ids.size()) + (next_token == eos_id ? 1 : 0), stats.passes,
+                                stats.drafted, stats.accepted);
+        } else if (primary_is_gpu) {
             // Static-graph step path (GPU). max_n_kv: pad to next power of two
             // with a 1024 floor — Vulkan/Metal flash-attn dispatches ~30%
             // faster on pow2 ne[1].
