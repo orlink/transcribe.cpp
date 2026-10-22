@@ -54,12 +54,13 @@ DecoderBuild build_cross_kv_graph(ggml_context *        ctx,
                                   CanaryKvCache &       kv_cache,
                                   int                   T_enc);
 
-// Build a decoder graph that uses the KV cache. Works for both prompt
-// pass (n_tokens > 1, n_past == 0) and step pass (n_tokens == 1).
+// Build a decoder graph that uses the KV cache. Works for the prompt pass
+// (n_tokens > 1, n_past == 0), the step pass (n_tokens == 1) and draft
+// verification (n_tokens > 1, n_past > 0; causal within the new tokens).
 //
-// skip_log_softmax: when true, skip the log-softmax tail and add a GPU
-// argmax over the last new-token position (saves a vocab-wide softmax
-// per step). The pre-softmax logits remain available via dumps.logits_raw.
+// skip_log_softmax: when true, skip the log-softmax tail, run the LM head
+// on the last n_out positions only and add a backend argmax over them
+// (argmax_out is i32 [n_out]). dumps.logits_raw then holds those n_out rows.
 DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
                                     const CanaryWeights & w,
                                     const CanaryHParams & hp,
@@ -68,7 +69,8 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
                                     int                   n_past,
                                     int                   T_enc,
                                     bool                  skip_log_softmax = false,
-                                    bool                  use_flash        = true);
+                                    bool                  use_flash        = true,
+                                    int                   n_out            = 1);
 
 // Static-topology single-token decoder graph. Built once per utterance
 // after the prompt pass and reused for every step in the autoregressive
