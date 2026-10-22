@@ -44,6 +44,7 @@ struct cli_args {
     std::vector<std::string> vocabulary;  // --vocabulary TERMS / --vocabulary-file PATH
     std::string              prompt;      // --prompt TEXT
     std::string              prefix;      // --prefix TEXT
+    std::string              draft;       // --draft-text TEXT (transcribe_run_params::draft)
 
     // Whisper-family knobs. Ignored for non-Whisper models.
     std::string                              initial_prompt;                    // --initial-prompt TEXT

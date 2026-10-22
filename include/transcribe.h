@@ -1202,7 +1202,9 @@ TRANSCRIBE_API void transcribe_session_params_init(struct transcribe_session_par
  * spec_k_drafts: speculative-decode draft length for offline runs: -1 is
  *              the model default, 0 disables it, >0 drafts K tokens per
  *              verify pass. Ignored unless the model reports
- *              transcribe_capabilities::supports_spec_decode.
+ *              transcribe_capabilities::supports_spec_decode or
+ *              TRANSCRIBE_FEATURE_DRAFT; with a `draft`, it caps the draft
+ *              tokens per verify pass.
  *
  * Generic prompting (vocabulary, prompt, prefix): NULL / 0 / "" means
  * unused. Each field is gated by the TRANSCRIBE_FEATURE_* bit in
@@ -1221,6 +1223,15 @@ TRANSCRIBE_API void transcribe_session_params_init(struct transcribe_session_par
  *              (TRANSCRIPT_PREFIX). Results hold only the continuation,
  *              except raw_text. An error when unsupported, and under
  *              INSTRUCT, batch or streaming.
+ *
+ * draft:       text expected to be close to the transcript, such as a
+ *              first-pass recognizer's output for the same audio, or NULL.
+ *              Families with TRANSCRIBE_FEATURE_DRAFT verify several draft
+ *              tokens per decoder pass and keep the ones their own greedy
+ *              choice agrees with, so a close draft saves decoder passes. The
+ *              draft never changes the result: the output is the greedy
+ *              output without it. Used by transcribe_run only; ignored
+ *              elsewhere and by families without the feature.
  */
 struct transcribe_run_params {
     uint64_t struct_size;
@@ -1240,6 +1251,7 @@ struct transcribe_run_params {
     int32_t              n_vocabulary;
     const char *         prompt;
     const char *         prefix;
+    const char *         draft;
 };
 
 TRANSCRIBE_API void transcribe_run_params_init(struct transcribe_run_params * params);
@@ -1496,6 +1508,9 @@ TRANSCRIBE_API transcribe_status transcribe_model_get_capabilities(const struct 
  *
  *   TRANSCRIPT_PREFIX    transcribe_run_params::prefix is honored.
  *
+ *   DRAFT                transcribe_run_params::draft is verified by the
+ *                        decoder (speed only; results are unchanged).
+ *
  * Returns false on NULL model or unknown feature enum.
  */
 typedef enum {
@@ -1510,6 +1525,7 @@ typedef enum {
     TRANSCRIBE_FEATURE_CONTEXT_PROMPT       = 8,
     TRANSCRIBE_FEATURE_INSTRUCT             = 9,
     TRANSCRIBE_FEATURE_TRANSCRIPT_PREFIX    = 10,
+    TRANSCRIBE_FEATURE_DRAFT                = 11,
 } transcribe_feature;
 
 TRANSCRIBE_API bool transcribe_model_supports(const struct transcribe_model * model, transcribe_feature feature);

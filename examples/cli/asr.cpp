@@ -215,6 +215,7 @@ void apply_prompting(const cli_args & args, transcribe_run_params & rp, std::vec
     rp.n_vocabulary = static_cast<int32_t>(vocabulary_ptrs.size());
     rp.prompt       = args.prompt.empty() ? nullptr : args.prompt.c_str();
     rp.prefix       = args.prefix.empty() ? nullptr : args.prefix.c_str();
+    rp.draft        = args.draft.empty() ? nullptr : args.draft.c_str();
 }
 
 }  // namespace

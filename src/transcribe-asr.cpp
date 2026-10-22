@@ -284,6 +284,11 @@ void strip_ignored_prompting(const transcribe_model * model, transcribe_run_para
     if (!transcribe::prompting::has_text(params->prefix)) {
         params->prefix = nullptr;
     }
+    // A draft never changes the result, so a family without the feature
+    // drops it without a warning.
+    if (!transcribe::prompting::has_text(params->draft) || !transcribe::has_feature(model, TRANSCRIBE_FEATURE_DRAFT)) {
+        params->draft = nullptr;
+    }
 }
 
 // The pre-clear prompting step every entry point shares, on a validated
@@ -1091,6 +1096,7 @@ static transcribe_status transcribe_stream_begin_impl(struct transcribe_session 
     run_params_owned.n_vocabulary = static_cast<int32_t>(session->stream_vocabulary_ptrs.size());
     run_params_owned.prompt       = run_params->prompt != nullptr ? session->stream_prompt_owned.c_str() : nullptr;
     run_params_owned.prefix       = nullptr;
+    run_params_owned.draft        = nullptr;
 
     const transcribe_status st = call_stream_hook(
         session, [&] { return session->model->arch->stream_begin(session, &run_params_owned, stream_params); });
@@ -1585,6 +1591,9 @@ static transcribe_status transcribe_run_batch_impl(struct transcribe_session *  
                             "and is not accepted in a batch");
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
+    // A draft describes one utterance too; it only saves decoder passes, so
+    // it is dropped rather than rejected.
+    params_view.draft = nullptr;
 
     // Shared-param validation, ONCE, mirroring transcribe_run's pre-clear
     // gates (ext shape/kind, pnc/itn advisory, enum range, timestamp
