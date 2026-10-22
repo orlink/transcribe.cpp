@@ -100,6 +100,11 @@ struct ggml_backend_cpu_context {
     int                 n_threads;
     ggml_threadpool_t   threadpool;
 
+    // pool kept across graph computes when no threadpool is set, so each compute
+    // does not start and join its own threads (GGML_CPU_DISPOSABLE_THREADPOOL=1: off)
+    ggml_threadpool_t   owned_threadpool;
+    int                 owned_n_threads;
+
     uint8_t *           work_data;
     size_t              work_size;
 
@@ -117,6 +122,9 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    if (cpu_ctx->owned_threadpool) {
+        ggml_threadpool_free(cpu_ctx->owned_threadpool);
+    }
     delete[] cpu_ctx->work_data;
     delete cpu_ctx;
     delete backend;
@@ -170,7 +178,24 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+    ggml_threadpool_t threadpool = cpu_ctx->threadpool;
+    if (threadpool == NULL && cpu_ctx->n_threads > 1) {
+        static const bool disposable = getenv("GGML_CPU_DISPOSABLE_THREADPOOL") != NULL;
+        if (!disposable) {
+            if (cpu_ctx->owned_threadpool && cpu_ctx->owned_n_threads != cpu_ctx->n_threads) {
+                ggml_threadpool_free(cpu_ctx->owned_threadpool);
+                cpu_ctx->owned_threadpool = NULL;
+            }
+            if (cpu_ctx->owned_threadpool == NULL) {
+                struct ggml_threadpool_params tpp = ggml_threadpool_params_default(cpu_ctx->n_threads);
+                cpu_ctx->owned_threadpool = ggml_threadpool_new(&tpp);
+                cpu_ctx->owned_n_threads  = cpu_ctx->n_threads;
+            }
+            threadpool = cpu_ctx->owned_threadpool;
+        }
+    }
+
+    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, threadpool);
 
     if (cpu_ctx->work_size < cplan.work_size) {
         delete[] cpu_ctx->work_data;
@@ -225,6 +250,8 @@ ggml_backend_t ggml_backend_cpu_init(void) {
 
     ctx->n_threads           = GGML_DEFAULT_N_THREADS;
     ctx->threadpool          = NULL;
+    ctx->owned_threadpool    = NULL;
+    ctx->owned_n_threads     = 0;
     ctx->work_data           = NULL;
     ctx->work_size           = 0;
     ctx->abort_callback      = NULL;
