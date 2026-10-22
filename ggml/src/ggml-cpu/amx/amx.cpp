@@ -33,6 +33,11 @@ class tensor_traits : public ggml::cpu::tensor_traits {
         }
         return false;
     }
+
+    bool compute_forward_mul_mat_add(struct ggml_compute_params * params, struct ggml_tensor * mm,
+                                     struct ggml_tensor * add) override {
+        return ggml_backend_amx_mul_mat_add(params, mm, add);
+    }
 };
 
 static ggml::cpu::tensor_traits * get_tensor_traits(ggml_backend_buffer_t, struct ggml_tensor *) {

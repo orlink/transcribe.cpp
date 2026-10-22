@@ -1988,7 +1988,7 @@ struct tinygemm_kernel_vnni<block_q8_K, block_iq4_xs, float, BLOCK_M, BLOCK_N, B
     tinygemm_kernel_vnni<vec_dot_type, type, float, 1, NB_SIZE, blck_size>::apply(             \
         KB, wdata_batch,                                                                       \
         (const char *)src0->data + src0_offset + PACKED_INDEX(nb * kTilesN, 0, KB, TILE_SIZE), \
-        (float *) dst->data + dst_offset + nb_start, ldc)
+        out_data + dst_offset + nb_start, ldc)
 
 template <typename TA, typename TB, typename TC, int BLOCK_K,
           typename std::enable_if<!is_type_qkk<TB>::value, int>::type = 0>
@@ -2403,7 +2403,8 @@ inline void amx_q8_0_acc_group(float * RESTRICT C, int ldb, const amx_q8_0_total
 // tile times B tiles 0 / 1, C tiles 1 / 3 the second
 void amx_q8_0_panel(int nr0, int nr1, int KB, const int8_t * RESTRICT A0, const int8_t * RESTRICT A1,
                     const float * RESTRICT s0, const float * RESTRICT s1, const char * RESTRICT B0,
-                    const char * RESTRICT B1, int tile_size, float * RESTRICT C, int ldc) {
+                    const char * RESTRICT B1, int tile_size, float * RESTRICT C, int ldc,
+                    const float * RESTRICT bias) {
     alignas(64) amx_q8_0_totals ring[AMX_Q8_RING];
     // C is accumulated in a contiguous block and copied out at the end: dst rows are usually a
     // multiple of 4 KB apart, so its rows of one panel share a few L1 sets and evict each other
@@ -2448,6 +2449,16 @@ void amx_q8_0_panel(int nr0, int nr1, int KB, const int8_t * RESTRICT A0, const 
         }
     }
     consume((KB - 1) / AMX_Q8_GROUP * AMX_Q8_GROUP, KB - 1);
+    if (bias != nullptr) {
+        // the bias add of a fused MUL_MAT + ADD: one rounding, as the ADD node
+        const __m512 b0 = _mm512_loadu_ps(bias);
+        const __m512 b1 = _mm512_loadu_ps(bias + TILE_N);
+        for (int m = 0; m < nr0 + nr1; ++m) {
+            _mm512_storeu_ps(C + m * ldc, _mm512_add_ps(_mm512_load_ps(cb + m * ldb), b0));
+            _mm512_storeu_ps(C + m * ldc + TILE_N, _mm512_add_ps(_mm512_load_ps(cb + m * ldb + TILE_N), b1));
+        }
+        return;
+    }
     for (int m = 0; m < nr0 + nr1; ++m) {
         _mm512_storeu_ps(C + m * ldc, _mm512_load_ps(cb + m * ldb));
         _mm512_storeu_ps(C + m * ldc + TILE_N, _mm512_load_ps(cb + m * ldb + TILE_N));
@@ -2455,7 +2466,7 @@ void amx_q8_0_panel(int nr0, int nr1, int KB, const int8_t * RESTRICT A0, const 
 }
 
 void amx_q8_0_mul_mat(const ggml_compute_params * params, const ggml_tensor * src0, const ggml_tensor * src1,
-                      ggml_tensor * dst) {
+                      ggml_tensor * dst, float * out_data, const float * bias) {
     const int     M       = dst->ne[1];
     const int     N       = dst->ne[0];
     const int     K       = src0->ne[0];
@@ -2499,13 +2510,15 @@ void amx_q8_0_mul_mat(const ggml_compute_params * params, const ggml_tensor * sr
             const float *  scales = (const float *) (wdata + b * a_size + (size_t) MT * KB * AMX_Q8_A_TILE);
             const char *   B0 = (const char *) src0->data + ggml_batch_offset(src0, b, ne2) + PACKED_INDEX(nb * 2, 0, KB, tile_size);
             const char *   B1 = B0 + (size_t) KB * tile_size;
-            float *        Cb = (float *) ((char *) dst->data + ggml_batch_offset(dst, b, ne2)) + nb * 2 * TILE_N;
+            float *        Cb = (float *) ((char *) out_data + ggml_batch_offset(dst, b, ne2)) + nb * 2 * TILE_N;
+            const float *  bp = bias != nullptr ? bias + nb * 2 * TILE_N : nullptr;
             for (int mt = 0; mt < MT; mt += 2) {
                 const int nr0 = std::min(TILE_M, M - mt * TILE_M);
                 const int nr1 = mt + 1 < MT ? std::min(TILE_M, M - (mt + 1) * TILE_M) : 0;
                 amx_q8_0_panel(nr0, nr1, KB, packed + (size_t) mt * KB * AMX_Q8_A_TILE,
                                packed + (size_t) (mt + 1) * KB * AMX_Q8_A_TILE, scales + (size_t) mt * TILE_M * KB,
-                               scales + (size_t) (mt + 1) * TILE_M * KB, B0, B1, tile_size, Cb + (size_t) mt * TILE_M * ldc, ldc);
+                               scales + (size_t) (mt + 1) * TILE_M * KB, B0, B1, tile_size, Cb + (size_t) mt * TILE_M * ldc, ldc,
+                               bp);
             }
         }
     });
@@ -2553,7 +2566,11 @@ size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst) {
 //
 // the function performs: dst = src1 @ src0.T for each batch
 //
-void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_tensor * dst) {
+// out_data: where the result goes (dst->data, or the ADD node of a fused MUL_MAT + ADD); bias: the
+// ADD's row, added once each output is complete. Bias is only taken by the paths that
+// ggml_backend_amx_mul_mat_add accepts.
+static void amx_mul_mat_impl(const ggml_compute_params * params, struct ggml_tensor * dst, float * out_data,
+                             const float * bias) {
     struct ggml_tensor * src0 = dst->src[0];
     struct ggml_tensor * src1 = dst->src[1];
 
@@ -2616,9 +2633,10 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
     }
 
     if (amx_q8_0_use_new(src0, M)) {
-        amx_q8_0_mul_mat(params, src0, src1, dst);
+        amx_q8_0_mul_mat(params, src0, src1, dst, out_data, bias);
         return;
     }
+    GGML_ASSERT(M == 1 || (bias == nullptr && out_data == (float *) dst->data));
 
     // pointer to work space, used convert A from float to quantized type
     void * wdata = params->wdata;
@@ -2687,6 +2705,12 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                         case 32: LAUNCH_TINYGEMM_KERNEL_VNNI(32); break;
                         default: fprintf(stderr, "Unexpected n block size!\n");
                     }
+                    if (bias != nullptr) {
+                        float * c = out_data + nb_start;
+                        for (int j = 0; j < nb_size; ++j) {
+                            c[j] = c[j] + bias[nb_start + j];
+                        }
+                    }
                 }
             });
         }
@@ -2731,6 +2755,24 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
             }
         });
     });
+}
+
+void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_tensor * dst) {
+    amx_mul_mat_impl(params, dst, (float *) dst->data, nullptr);
+}
+
+bool ggml_backend_amx_mul_mat_add(const ggml_compute_params * params, struct ggml_tensor * mm, struct ggml_tensor * add) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * bias = add->src[0] == mm ? add->src[1] : add->src[0];
+    const int           M    = mm->ne[1];
+    if (src0->type != GGML_TYPE_Q8_0 || mm->ne[2] * mm->ne[3] != 1 || !(M == 1 || amx_q8_0_use_new(src0, M)) ||
+        bias->type != GGML_TYPE_F32 || ggml_nrows(bias) != 1 || bias->ne[0] != mm->ne[0] ||
+        bias->nb[0] != sizeof(float) || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
+        !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    amx_mul_mat_impl(params, mm, (float *) add->data, (const float *) bias->data);
+    return true;
 }
 
 #endif // if defined(__AMX_INT8__) && defined(__AVX512VNNI__)

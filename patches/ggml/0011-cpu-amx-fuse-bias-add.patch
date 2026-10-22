@@ -1,0 +1,220 @@
+diff --git a/src/ggml-cpu/amx/amx.cpp b/src/ggml-cpu/amx/amx.cpp
+index e90c279..a30a8ef 100644
+--- a/src/ggml-cpu/amx/amx.cpp
++++ b/src/ggml-cpu/amx/amx.cpp
+@@ -33,6 +33,11 @@ class tensor_traits : public ggml::cpu::tensor_traits {
+         }
+         return false;
+     }
++
++    bool compute_forward_mul_mat_add(struct ggml_compute_params * params, struct ggml_tensor * mm,
++                                     struct ggml_tensor * add) override {
++        return ggml_backend_amx_mul_mat_add(params, mm, add);
++    }
+ };
+ 
+ static ggml::cpu::tensor_traits * get_tensor_traits(ggml_backend_buffer_t, struct ggml_tensor *) {
+diff --git a/src/ggml-cpu/amx/mmq.cpp b/src/ggml-cpu/amx/mmq.cpp
+index ffa7dfb..dfa4b2b 100644
+--- a/src/ggml-cpu/amx/mmq.cpp
++++ b/src/ggml-cpu/amx/mmq.cpp
+@@ -1988,7 +1988,7 @@ struct tinygemm_kernel_vnni<block_q8_K, block_iq4_xs, float, BLOCK_M, BLOCK_N, B
+     tinygemm_kernel_vnni<vec_dot_type, type, float, 1, NB_SIZE, blck_size>::apply(             \
+         KB, wdata_batch,                                                                       \
+         (const char *)src0->data + src0_offset + PACKED_INDEX(nb * kTilesN, 0, KB, TILE_SIZE), \
+-        (float *) dst->data + dst_offset + nb_start, ldc)
++        out_data + dst_offset + nb_start, ldc)
+ 
+ template <typename TA, typename TB, typename TC, int BLOCK_K,
+           typename std::enable_if<!is_type_qkk<TB>::value, int>::type = 0>
+@@ -2403,7 +2403,8 @@ inline void amx_q8_0_acc_group(float * RESTRICT C, int ldb, const amx_q8_0_total
+ // tile times B tiles 0 / 1, C tiles 1 / 3 the second
+ void amx_q8_0_panel(int nr0, int nr1, int KB, const int8_t * RESTRICT A0, const int8_t * RESTRICT A1,
+                     const float * RESTRICT s0, const float * RESTRICT s1, const char * RESTRICT B0,
+-                    const char * RESTRICT B1, int tile_size, float * RESTRICT C, int ldc) {
++                    const char * RESTRICT B1, int tile_size, float * RESTRICT C, int ldc,
++                    const float * RESTRICT bias) {
+     alignas(64) amx_q8_0_totals ring[AMX_Q8_RING];
+     // C is accumulated in a contiguous block and copied out at the end: dst rows are usually a
+     // multiple of 4 KB apart, so its rows of one panel share a few L1 sets and evict each other
+@@ -2448,6 +2449,16 @@ void amx_q8_0_panel(int nr0, int nr1, int KB, const int8_t * RESTRICT A0, const
+         }
+     }
+     consume((KB - 1) / AMX_Q8_GROUP * AMX_Q8_GROUP, KB - 1);
++    if (bias != nullptr) {
++        // the bias add of a fused MUL_MAT + ADD: one rounding, as the ADD node
++        const __m512 b0 = _mm512_loadu_ps(bias);
++        const __m512 b1 = _mm512_loadu_ps(bias + TILE_N);
++        for (int m = 0; m < nr0 + nr1; ++m) {
++            _mm512_storeu_ps(C + m * ldc, _mm512_add_ps(_mm512_load_ps(cb + m * ldb), b0));
++            _mm512_storeu_ps(C + m * ldc + TILE_N, _mm512_add_ps(_mm512_load_ps(cb + m * ldb + TILE_N), b1));
++        }
++        return;
++    }
+     for (int m = 0; m < nr0 + nr1; ++m) {
+         _mm512_storeu_ps(C + m * ldc, _mm512_load_ps(cb + m * ldb));
+         _mm512_storeu_ps(C + m * ldc + TILE_N, _mm512_load_ps(cb + m * ldb + TILE_N));
+@@ -2455,7 +2466,7 @@ void amx_q8_0_panel(int nr0, int nr1, int KB, const int8_t * RESTRICT A0, const
+ }
+ 
+ void amx_q8_0_mul_mat(const ggml_compute_params * params, const ggml_tensor * src0, const ggml_tensor * src1,
+-                      ggml_tensor * dst) {
++                      ggml_tensor * dst, float * out_data, const float * bias) {
+     const int     M       = dst->ne[1];
+     const int     N       = dst->ne[0];
+     const int     K       = src0->ne[0];
+@@ -2499,13 +2510,15 @@ void amx_q8_0_mul_mat(const ggml_compute_params * params, const ggml_tensor * sr
+             const float *  scales = (const float *) (wdata + b * a_size + (size_t) MT * KB * AMX_Q8_A_TILE);
+             const char *   B0 = (const char *) src0->data + ggml_batch_offset(src0, b, ne2) + PACKED_INDEX(nb * 2, 0, KB, tile_size);
+             const char *   B1 = B0 + (size_t) KB * tile_size;
+-            float *        Cb = (float *) ((char *) dst->data + ggml_batch_offset(dst, b, ne2)) + nb * 2 * TILE_N;
++            float *        Cb = (float *) ((char *) out_data + ggml_batch_offset(dst, b, ne2)) + nb * 2 * TILE_N;
++            const float *  bp = bias != nullptr ? bias + nb * 2 * TILE_N : nullptr;
+             for (int mt = 0; mt < MT; mt += 2) {
+                 const int nr0 = std::min(TILE_M, M - mt * TILE_M);
+                 const int nr1 = mt + 1 < MT ? std::min(TILE_M, M - (mt + 1) * TILE_M) : 0;
+                 amx_q8_0_panel(nr0, nr1, KB, packed + (size_t) mt * KB * AMX_Q8_A_TILE,
+                                packed + (size_t) (mt + 1) * KB * AMX_Q8_A_TILE, scales + (size_t) mt * TILE_M * KB,
+-                               scales + (size_t) (mt + 1) * TILE_M * KB, B0, B1, tile_size, Cb + (size_t) mt * TILE_M * ldc, ldc);
++                               scales + (size_t) (mt + 1) * TILE_M * KB, B0, B1, tile_size, Cb + (size_t) mt * TILE_M * ldc, ldc,
++                               bp);
+             }
+         }
+     });
+@@ -2553,7 +2566,11 @@ size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst) {
+ //
+ // the function performs: dst = src1 @ src0.T for each batch
+ //
+-void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_tensor * dst) {
++// out_data: where the result goes (dst->data, or the ADD node of a fused MUL_MAT + ADD); bias: the
++// ADD's row, added once each output is complete. Bias is only taken by the paths that
++// ggml_backend_amx_mul_mat_add accepts.
++static void amx_mul_mat_impl(const ggml_compute_params * params, struct ggml_tensor * dst, float * out_data,
++                             const float * bias) {
+     struct ggml_tensor * src0 = dst->src[0];
+     struct ggml_tensor * src1 = dst->src[1];
+ 
+@@ -2616,9 +2633,10 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
+     }
+ 
+     if (amx_q8_0_use_new(src0, M)) {
+-        amx_q8_0_mul_mat(params, src0, src1, dst);
++        amx_q8_0_mul_mat(params, src0, src1, dst, out_data, bias);
+         return;
+     }
++    GGML_ASSERT(M == 1 || (bias == nullptr && out_data == (float *) dst->data));
+ 
+     // pointer to work space, used convert A from float to quantized type
+     void * wdata = params->wdata;
+@@ -2687,6 +2705,12 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
+                         case 32: LAUNCH_TINYGEMM_KERNEL_VNNI(32); break;
+                         default: fprintf(stderr, "Unexpected n block size!\n");
+                     }
++                    if (bias != nullptr) {
++                        float * c = out_data + nb_start;
++                        for (int j = 0; j < nb_size; ++j) {
++                            c[j] = c[j] + bias[nb_start + j];
++                        }
++                    }
+                 }
+             });
+         }
+@@ -2733,4 +2757,22 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
+     });
+ }
+ 
++void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_tensor * dst) {
++    amx_mul_mat_impl(params, dst, (float *) dst->data, nullptr);
++}
++
++bool ggml_backend_amx_mul_mat_add(const ggml_compute_params * params, struct ggml_tensor * mm, struct ggml_tensor * add) {
++    const ggml_tensor * src0 = mm->src[0];
++    const ggml_tensor * bias = add->src[0] == mm ? add->src[1] : add->src[0];
++    const int           M    = mm->ne[1];
++    if (src0->type != GGML_TYPE_Q8_0 || mm->ne[2] * mm->ne[3] != 1 || !(M == 1 || amx_q8_0_use_new(src0, M)) ||
++        bias->type != GGML_TYPE_F32 || ggml_nrows(bias) != 1 || bias->ne[0] != mm->ne[0] ||
++        bias->nb[0] != sizeof(float) || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
++        !ggml_is_contiguous(mm)) {
++        return false;
++    }
++    amx_mul_mat_impl(params, mm, (float *) add->data, (const float *) bias->data);
++    return true;
++}
++
+ #endif // if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+diff --git a/src/ggml-cpu/amx/mmq.h b/src/ggml-cpu/amx/mmq.h
+index baf7684..19bd436 100644
+--- a/src/ggml-cpu/amx/mmq.h
++++ b/src/ggml-cpu/amx/mmq.h
+@@ -8,3 +8,6 @@ size_t ggml_backend_amx_get_alloc_size(const struct ggml_tensor * tensor);
+ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+ 
+ void ggml_backend_amx_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++
++// MUL_MAT + ADD of a bias row in one pass, into add's data; false if this shape is not handled
++bool ggml_backend_amx_mul_mat_add(const struct ggml_compute_params * params, struct ggml_tensor * mm, struct ggml_tensor * add);
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 5c72ff5..b18a73f 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -3111,6 +3111,15 @@ static int ggml_cpu_try_fuse_ops(
+ 
+     struct ggml_tensor * node = cgraph->nodes[node_n];
+ 
++    if (node->op == GGML_OP_MUL_MAT) {
++        // MUL_MAT + ADD of a bias row, when an extra buffer type's kernel can add it on the way out
++        const enum ggml_op fuse_ops[] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
++        if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2) &&
++            ggml_cpu_extra_compute_forward_mul_mat_add((struct ggml_compute_params *) params, node, cgraph->nodes[node_n + 1])) {
++            return 1;
++        }
++    }
++
+     if (node->op == GGML_OP_NORM) {
+         // NORM + MUL + ADD (layer norm with weight and bias)
+         const enum ggml_op fuse_ops[] = { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD };
+diff --git a/src/ggml-cpu/traits.cpp b/src/ggml-cpu/traits.cpp
+index 4f32f10..8e4e572 100644
+--- a/src/ggml-cpu/traits.cpp
++++ b/src/ggml-cpu/traits.cpp
+@@ -34,3 +34,16 @@ bool ggml_cpu_extra_work_size(int n_threads, const struct ggml_tensor * op, size
+     }
+     return false;
+ }
++
++bool ggml_cpu_extra_compute_forward_mul_mat_add(struct ggml_compute_params * params, struct ggml_tensor * mm, struct ggml_tensor * add) {
++    for (auto extra : ggml_backend_cpu_get_extra_buffer_types()) {
++        if (extra && extra->context) {
++            auto buf_extra     = (ggml::cpu::extra_buffer_type *) extra->context;
++            auto tensor_traits = buf_extra->get_tensor_traits(mm);
++            if (tensor_traits && tensor_traits->compute_forward_mul_mat_add(params, mm, add)) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
+diff --git a/src/ggml-cpu/traits.h b/src/ggml-cpu/traits.h
+index f4e0990..8e0eb5b 100644
+--- a/src/ggml-cpu/traits.h
++++ b/src/ggml-cpu/traits.h
+@@ -11,6 +11,8 @@ extern "C" {
+ // return true if op part of extra "accelerator"
+ bool ggml_cpu_extra_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op);
+ bool ggml_cpu_extra_work_size(int n_threads, const struct ggml_tensor * op, size_t * size);
++// MUL_MAT `mm` followed by `add` = mm + a bias row, computed into add; false if no extra buffer handles it
++bool ggml_cpu_extra_compute_forward_mul_mat_add(struct ggml_compute_params * params, struct ggml_tensor * mm, struct ggml_tensor * add);
+ 
+ #ifdef __cplusplus
+ }
+@@ -22,6 +24,10 @@ class tensor_traits {
+     virtual ~tensor_traits();
+     virtual bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size)        = 0;
+     virtual bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) = 0;
++    virtual bool compute_forward_mul_mat_add(struct ggml_compute_params * /*params*/, struct ggml_tensor * /*mm*/,
++                                             struct ggml_tensor * /*add*/) {
++        return false;
++    }
+ };
+ 
+ class extra_buffer_type {

@@ -11,6 +11,8 @@ extern "C" {
 // return true if op part of extra "accelerator"
 bool ggml_cpu_extra_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op);
 bool ggml_cpu_extra_work_size(int n_threads, const struct ggml_tensor * op, size_t * size);
+// MUL_MAT `mm` followed by `add` = mm + a bias row, computed into add; false if no extra buffer handles it
+bool ggml_cpu_extra_compute_forward_mul_mat_add(struct ggml_compute_params * params, struct ggml_tensor * mm, struct ggml_tensor * add);
 
 #ifdef __cplusplus
 }
@@ -22,6 +24,10 @@ class tensor_traits {
     virtual ~tensor_traits();
     virtual bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size)        = 0;
     virtual bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) = 0;
+    virtual bool compute_forward_mul_mat_add(struct ggml_compute_params * /*params*/, struct ggml_tensor * /*mm*/,
+                                             struct ggml_tensor * /*add*/) {
+        return false;
+    }
 };
 
 class extra_buffer_type {

@@ -3111,6 +3111,15 @@ static int ggml_cpu_try_fuse_ops(
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
 
+    if (node->op == GGML_OP_MUL_MAT) {
+        // MUL_MAT + ADD of a bias row, when an extra buffer type's kernel can add it on the way out
+        const enum ggml_op fuse_ops[] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+        if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2) &&
+            ggml_cpu_extra_compute_forward_mul_mat_add((struct ggml_compute_params *) params, node, cgraph->nodes[node_n + 1])) {
+            return 1;
+        }
+    }
+
     if (node->op == GGML_OP_NORM) {
         // NORM + MUL + ADD (layer norm with weight and bias)
         const enum ggml_op fuse_ops[] = { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD };

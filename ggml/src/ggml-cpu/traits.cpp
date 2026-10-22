@@ -34,3 +34,16 @@ bool ggml_cpu_extra_work_size(int n_threads, const struct ggml_tensor * op, size
     }
     return false;
 }
+
+bool ggml_cpu_extra_compute_forward_mul_mat_add(struct ggml_compute_params * params, struct ggml_tensor * mm, struct ggml_tensor * add) {
+    for (auto extra : ggml_backend_cpu_get_extra_buffer_types()) {
+        if (extra && extra->context) {
+            auto buf_extra     = (ggml::cpu::extra_buffer_type *) extra->context;
+            auto tensor_traits = buf_extra->get_tensor_traits(mm);
+            if (tensor_traits && tensor_traits->compute_forward_mul_mat_add(params, mm, add)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
