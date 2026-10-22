@@ -6758,10 +6758,20 @@ static void ggml_compute_forward_im2col_f32(
     {
         float * const wdata = (float *) dst->data;
 
-        for (int64_t in = 0; in < N; in++) {
-            for (int64_t ioh = 0; ioh < OH; ioh++) { // 1
+        // with fewer channels than threads, split the output rows instead
+        const bool    split_rows = IC < nth;
+        const int64_t n_rows     = N*OH;
+        const int64_t ir0        = split_rows ? (n_rows*ith)/nth       : 0;
+        const int64_t ir1        = split_rows ? (n_rows*(ith + 1))/nth : n_rows;
+        const int64_t iic0       = split_rows ? 0 : ith;
+        const int64_t iic_step   = split_rows ? 1 : nth;
+
+        for (int64_t ir = ir0; ir < ir1; ir++) {
+            const int64_t in  = ir / OH;
+            const int64_t ioh = ir % OH;
+            {
                 for (int64_t iow = 0; iow < OW; iow++) {
-                    for (int64_t iic = ith; iic < IC; iic += nth) {
+                    for (int64_t iic = iic0; iic < IC; iic += iic_step) {
 
                         // micro kernel
                         float * dst_data = wdata + (in*OH*OW + ioh*OW + iow)*(IC*KH*KW); // [IC, KH, KW]
@@ -6834,10 +6844,20 @@ static void ggml_compute_forward_im2col_f16(
     {
         ggml_fp16_t * const wdata = (ggml_fp16_t *) dst->data;
 
-        for (int64_t in = 0; in < N; in++) {
-            for (int64_t ioh = 0; ioh < OH; ioh++) { // 1
+        // with fewer channels than threads, split the output rows instead
+        const bool    split_rows = IC < nth;
+        const int64_t n_rows     = N*OH;
+        const int64_t ir0        = split_rows ? (n_rows*ith)/nth       : 0;
+        const int64_t ir1        = split_rows ? (n_rows*(ith + 1))/nth : n_rows;
+        const int64_t iic0       = split_rows ? 0 : ith;
+        const int64_t iic_step   = split_rows ? 1 : nth;
+
+        for (int64_t ir = ir0; ir < ir1; ir++) {
+            const int64_t in  = ir / OH;
+            const int64_t ioh = ir % OH;
+            {
                 for (int64_t iow = 0; iow < OW; iow++) {
-                    for (int64_t iic = ith; iic < IC; iic += nth) {
+                    for (int64_t iic = iic0; iic < IC; iic += iic_step) {
 
                         // micro kernel
                         ggml_fp16_t * dst_data = wdata + (in*OH*OW + ioh*OW + iow)*(IC*KH*KW); // [IC, KH, KW]
