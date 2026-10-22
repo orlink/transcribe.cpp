@@ -1,0 +1,41 @@
+diff --git a/src/ggml-cpu/amx/mmq.cpp b/src/ggml-cpu/amx/mmq.cpp
+index 2df3c87..ffa7dfb 100644
+--- a/src/ggml-cpu/amx/mmq.cpp
++++ b/src/ggml-cpu/amx/mmq.cpp
+@@ -2649,6 +2649,12 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
+         });
+  // }
+ 
++    // M == 1 hands out the column blocks dynamically: the weights stream from memory, and threads
++    // that get their data sooner take more blocks instead of waiting for the slowest one
++    if (M == 1 && params->ith == 0) {
++        ggml_threadpool_chunk_set(params->threadpool, params->nth);
++    }
++
+     ggml_barrier(params->threadpool);
+ 
+     if (M == 1) {
+@@ -2657,12 +2663,12 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
+         constexpr int BLOCK_N = TILE_N * kTilesN;
+         const int NB = div_up(N, BLOCK_N);
+ 
+-        parallel_for_ggml(params, n_batch * NB, [&](int begin, int end) {
++        {
+             GGML_DISPATCH_QTYPES(TYPE, [&] {
+                 const int KB = K / blck_size;
+                 const int TILE_SIZE = get_tile_size<type>();
+                 const int row_size_A = KB * sizeof(vec_dot_type);
+-                for (int i = begin; i < end; ++i) {
++                for (int i = params->ith; i < n_batch * NB; i = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+                     int batch_idx = i / NB;
+                     int nb = i % NB;
+ 
+@@ -2683,7 +2689,7 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
+                     }
+                 }
+             });
+-        });
++        }
+         return;
+     }
+ 
