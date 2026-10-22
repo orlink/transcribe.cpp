@@ -98,6 +98,9 @@ struct SessionCore {
     // Parakeet and Voxtral Realtime use per-chunk bounded stream workspaces;
     // Moonshine Streaming's decode graph cross-attends over the complete
     // committed stream, so its workspace grows with total stream length.
+    // TRANSCRIBE_KEEP_SCRATCH_MB=<n> keeps (resets) a scheduler whose
+    // buffers total at most n MiB instead of freeing it; compute_ctx is
+    // freed either way.
     // Must not throw. Non-virtual: a family cannot opt out of the release.
     void release_scratch() noexcept;
 

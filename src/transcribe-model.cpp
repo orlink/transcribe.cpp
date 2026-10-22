@@ -5,8 +5,10 @@
 #include "transcribe-model.h"
 
 #include "transcribe-backend.h"
+#include "transcribe-env.h"
 #include "transcribe-session.h"
 
+#include <cstdlib>
 #include <utility>
 
 transcribe_model::~transcribe_model() = default;
@@ -17,8 +19,42 @@ transcribe::SessionCore::~SessionCore() {
     transcribe::release_compute_scratch(sched, compute_ctx);
 }
 
+// TRANSCRIBE_KEEP_SCRATCH_MB=<n>: keep a scheduler whose buffers total at
+// most n MiB across offline runs (reset, not freed), so short runs do not
+// rebuild and re-fault the same workspace every time. Unset or 0: always free.
+static size_t keep_scratch_limit_bytes() noexcept {
+    static const size_t limit = [] {
+        const char * v = transcribe::env::str("TRANSCRIBE_KEEP_SCRATCH_MB");
+        if (v == nullptr) {
+            return static_cast<size_t>(0);
+        }
+        const long long mb = std::atoll(v);
+        return mb > 0 ? static_cast<size_t>(mb) * 1024 * 1024 : static_cast<size_t>(0);
+    }();
+    return limit;
+}
+
+static size_t sched_buffer_bytes(ggml_backend_sched_t sched) noexcept {
+    size_t total = 0;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        total += ggml_backend_sched_get_buffer_size(sched, ggml_backend_sched_get_backend(sched, i));
+    }
+    return total;
+}
+
 void transcribe::SessionCore::release_scratch() noexcept {
-    transcribe::release_compute_scratch(sched, compute_ctx);
+    const size_t limit = keep_scratch_limit_bytes();
+    if (sched != nullptr && limit > 0 && sched_buffer_bytes(sched) <= limit) {
+        // The reset drops the scheduler's references to this run's graph,
+        // whose tensors live in the compute context freed below.
+        ggml_backend_sched_reset(sched);
+        if (compute_ctx != nullptr) {
+            ggml_free(compute_ctx);
+            compute_ctx = nullptr;
+        }
+    } else {
+        transcribe::release_compute_scratch(sched, compute_ctx);
+    }
     on_scratch_released();
 }
 
