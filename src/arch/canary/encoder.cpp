@@ -21,11 +21,19 @@ namespace {
 
 namespace conf = transcribe::conformer;
 
-// Direct dw on every backend for the in-block site; im2col for pre-encode
-// (canary's encoder geometry matches parakeet's at the dw site).
+// Direct dw on every backend for the in-block site (canary's encoder
+// geometry matches parakeet's at the dw site).
 bool detect_direct_dw_in_block(const char * /*backend*/) {
     return conf::resolve_conv_direct("TRANSCRIBE_CONV_DIRECT_DW", "TRANSCRIBE_CONV_NO_DIRECT_DW",
                                      /*backend_default=*/true);
+}
+
+// Pre-encode depthwise: im2col by default. TRANSCRIBE_CONV_DIRECT_DW_PRE=1
+// runs the direct op instead, which skips the nine-fold im2col copy and the
+// per-channel [9 x 1] matmul but rounds the nine-term sums differently.
+bool detect_direct_dw_in_pre_encode(const char * /*backend*/) {
+    return conf::resolve_conv_direct("TRANSCRIBE_CONV_DIRECT_DW_PRE", "TRANSCRIBE_CONV_NO_DIRECT_DW_PRE",
+                                     /*backend_default=*/false);
 }
 
 conf::PreEncodeView to_view(const CanaryPreEncode & pe) {
@@ -105,7 +113,7 @@ EncoderBuild build_encoder_graph(ggml_context *        ctx,
     policy.direct_pw               = conf::detect_direct_pw(backend_name);
     const bool direct_dw           = detect_direct_dw_in_block(backend_name);
     policy.direct_dw_in_block      = direct_dw;
-    policy.direct_dw_in_pre_encode = false;  // parakeet-style: im2col here
+    policy.direct_dw_in_pre_encode = detect_direct_dw_in_pre_encode(backend_name);
 
     EncoderBuild eb{};
 
