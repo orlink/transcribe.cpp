@@ -2318,7 +2318,7 @@ namespace {
 //     difference of two stored running totals (exact in int32: a block sum is at most
 //     32 * 127 * 127, so K up to about 130k cannot overflow); this removes the zero -> dpbssd -> store
 //     -> zero chain per tile;
-//   - the AVX512 work for block k runs while the tiles of block k + 1 are computed (three buffers);
+//   - the AVX512 work for a group of blocks runs while the tiles of the next block are computed;
 //   - threads split the 32-column panels, and each thread runs every row block on a panel while it
 //     is in cache, so a weight panel is read from memory once.
 // GGML_AMX_Q8_0_LEGACY=1 uses the original kernel.
@@ -2351,33 +2351,72 @@ void amx_q8_0_pack_a_row(const float * x, int8_t * packed, float * scales, block
     }
 }
 
-// C (rows m0 .. m0 + nr, 16 columns) for block kb from the running totals cur - pre
-inline void amx_q8_0_acc_block(float * RESTRICT C, int ldc, const int32_t * RESTRICT cur, const int32_t * RESTRICT pre,
-                               const float * RESTRICT a_scales, int KB, int kb, const char * RESTRICT b_tile, int nr) {
-    const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (b_tile + TILE_N * TILE_K)));
+// Blocks are added to C in groups of AMX_Q8_GROUP: each C row is loaded and stored once per group
+// and each stored running total is read once, which keeps the loads and stores (shared with the
+// tile loads and stores) down. The running totals live in a ring of AMX_Q8_RING slots: a group,
+// the total before it, and the slot the next block's tiles are stored to.
+constexpr int AMX_Q8_GROUP = 4;
+constexpr int AMX_Q8_RING  = AMX_Q8_GROUP + 2;
+
+typedef int32_t amx_q8_0_totals[4][TILE_M * TILE_N];  // C tiles 0..3 of one block (see amx_q8_0_panel)
+
+// add blocks k0..k1 to rows [0, nr) of both 16-column tiles of a row block; c_tile0 / c_tile1 index the
+// stored C tiles (0 and 2 for the first A tile, 1 and 3 for the second); C row stride ldb
+inline void amx_q8_0_acc_group(float * RESTRICT C, int ldb, const amx_q8_0_totals * RESTRICT ring, int c_tile0,
+                               int c_tile1, const float * RESTRICT a_scales, int KB, int k0, int k1,
+                               const char * RESTRICT B0, const char * RESTRICT B1, int tile_size, int nr) {
+    const int n = k1 - k0 + 1;
+    __m512    vd00[AMX_Q8_GROUP];
+    __m512    vd01[AMX_Q8_GROUP];
+    for (int j = 0; j < n; ++j) {
+        const size_t off = (size_t) (k0 + j) * tile_size + TILE_N * TILE_K;
+        vd00[j]          = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (B0 + off)));
+        vd01[j]          = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (B1 + off)));
+    }
     for (int m = 0; m < nr; ++m) {
-        __m512i vi = _mm512_loadu_si512(cur + m * TILE_N);
-        if (pre != nullptr) {
-            vi = _mm512_sub_epi32(vi, _mm512_loadu_si512(pre + m * TILE_N));
+        __m512  c0 = _mm512_set1_ps(0.f);
+        __m512  c1 = _mm512_set1_ps(0.f);
+        __m512i p0 = _mm512_setzero_si512();
+        __m512i p1 = _mm512_setzero_si512();
+        if (k0 > 0) {
+            c0 = _mm512_load_ps(C + m * ldb);
+            c1 = _mm512_load_ps(C + m * ldb + TILE_N);
+            p0 = _mm512_load_si512(ring[(k0 - 1) % AMX_Q8_RING][c_tile0] + m * TILE_N);
+            p1 = _mm512_load_si512(ring[(k0 - 1) % AMX_Q8_RING][c_tile1] + m * TILE_N);
         }
-        const __m512 vd1   = _mm512_set1_ps(a_scales[m * KB + kb]);
-        const __m512 vtile = _mm512_cvtepi32_ps(vi);
-        __m512       vsum  = kb > 0 ? _mm512_loadu_ps(C + m * ldc) : _mm512_set1_ps(0.f);
-        vsum               = _mm512_fmadd_ps(vtile, _mm512_mul_ps(vd0, vd1), vsum);
-        _mm512_storeu_ps(C + m * ldc, vsum);
+        const float * as = a_scales + m * KB + k0;
+        for (int j = 0; j < n; ++j) {
+            const __m512i t0  = _mm512_load_si512(ring[(k0 + j) % AMX_Q8_RING][c_tile0] + m * TILE_N);
+            const __m512i t1  = _mm512_load_si512(ring[(k0 + j) % AMX_Q8_RING][c_tile1] + m * TILE_N);
+            const __m512  vd1 = _mm512_set1_ps(as[j]);
+            c0                = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(t0, p0)), _mm512_mul_ps(vd00[j], vd1), c0);
+            c1                = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(t1, p1)), _mm512_mul_ps(vd01[j], vd1), c1);
+            p0                = t0;
+            p1                = t1;
+        }
+        _mm512_store_ps(C + m * ldb, c0);
+        _mm512_store_ps(C + m * ldb + TILE_N, c1);
     }
 }
 
-// one 32-column panel (two B tiles) times rows [mt * 16, mt * 16 + 32) of A (one or two A tiles)
+// one 32-column panel (two B tiles) times one or two 16-row A tiles; C tiles 0 / 2 are the first A
+// tile times B tiles 0 / 1, C tiles 1 / 3 the second
 void amx_q8_0_panel(int nr0, int nr1, int KB, const int8_t * RESTRICT A0, const int8_t * RESTRICT A1,
                     const float * RESTRICT s0, const float * RESTRICT s1, const char * RESTRICT B0,
                     const char * RESTRICT B1, int tile_size, float * RESTRICT C, int ldc) {
-    alignas(64) int32_t buf[3][4][TILE_M * TILE_N];
+    alignas(64) amx_q8_0_totals ring[AMX_Q8_RING];
     // C is accumulated in a contiguous block and copied out at the end: dst rows are usually a
     // multiple of 4 KB apart, so its rows of one panel share a few L1 sets and evict each other
     constexpr int ldb = 2 * TILE_N;
     alignas(64) float cb[2 * TILE_M * ldb];
     const bool two = nr1 > 0;
+
+    auto consume = [&](int k0, int k1) {
+        amx_q8_0_acc_group(cb, ldb, ring, 0, 2, s0, KB, k0, k1, B0, B1, tile_size, nr0);
+        if (two) {
+            amx_q8_0_acc_group(cb + TILE_M * ldb, ldb, ring, 1, 3, s1, KB, k0, k1, B0, B1, tile_size, nr1);
+        }
+    };
 
     _tile_zero(TMM4);
     _tile_zero(TMM6);
@@ -2385,18 +2424,6 @@ void amx_q8_0_panel(int nr0, int nr1, int KB, const int8_t * RESTRICT A0, const 
         _tile_zero(TMM5);
         _tile_zero(TMM7);
     }
-    auto consume = [&](int kb) {
-        int32_t(*cur)[TILE_M * TILE_N] = buf[kb % 3];
-        int32_t(*pre)[TILE_M * TILE_N] = kb > 0 ? buf[(kb - 1) % 3] : nullptr;
-        const char * bt0 = B0 + (size_t) kb * tile_size;
-        const char * bt1 = B1 + (size_t) kb * tile_size;
-        amx_q8_0_acc_block(cb, ldb, cur[0], pre ? pre[0] : nullptr, s0, KB, kb, bt0, nr0);
-        amx_q8_0_acc_block(cb + TILE_N, ldb, cur[2], pre ? pre[2] : nullptr, s0, KB, kb, bt1, nr0);
-        if (two) {
-            amx_q8_0_acc_block(cb + TILE_M * ldb, ldb, cur[1], pre ? pre[1] : nullptr, s1, KB, kb, bt0, nr1);
-            amx_q8_0_acc_block(cb + TILE_M * ldb + TILE_N, ldb, cur[3], pre ? pre[3] : nullptr, s1, KB, kb, bt1, nr1);
-        }
-    };
     for (int kb = 0; kb < KB; ++kb) {
         _tile_loadd(TMM0, B0 + (size_t) kb * tile_size, TILE_N * VNNI_BLK);
         _tile_loadd(TMM1, B1 + (size_t) kb * tile_size, TILE_N * VNNI_BLK);
@@ -2408,18 +2435,19 @@ void amx_q8_0_panel(int nr0, int nr1, int KB, const int8_t * RESTRICT A0, const 
             _tile_dpbssd(TMM5, TMM3, TMM0);
             _tile_dpbssd(TMM7, TMM3, TMM1);
         }
-        int32_t(*cur)[TILE_M * TILE_N] = buf[kb % 3];
+        int32_t(*cur)[TILE_M * TILE_N] = ring[kb % AMX_Q8_RING];
         _tile_stored(TMM4, cur[0], TILE_N * sizeof(int32_t));
         _tile_stored(TMM6, cur[2], TILE_N * sizeof(int32_t));
         if (two) {
             _tile_stored(TMM5, cur[1], TILE_N * sizeof(int32_t));
             _tile_stored(TMM7, cur[3], TILE_N * sizeof(int32_t));
         }
-        if (kb > 0) {
-            consume(kb - 1);
+        // the group that ended with the previous block, while this block's tiles are in flight
+        if (kb > 0 && kb % AMX_Q8_GROUP == 0) {
+            consume(kb - AMX_Q8_GROUP, kb - 1);
         }
     }
-    consume(KB - 1);
+    consume((KB - 1) / AMX_Q8_GROUP * AMX_Q8_GROUP, KB - 1);
     for (int m = 0; m < nr0 + nr1; ++m) {
         _mm512_storeu_ps(C + m * ldc, _mm512_load_ps(cb + m * ldb));
         _mm512_storeu_ps(C + m * ldc + TILE_N, _mm512_load_ps(cb + m * ldb + TILE_N));

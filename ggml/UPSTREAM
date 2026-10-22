@@ -8,6 +8,7 @@ patches:
   patches/ggml/0005-cpu-im2col-split-rows.patch
   patches/ggml/0006-cpu-amx-q8_0-gemm.patch
   patches/ggml/0007-cpu-threadpool-no-poll.patch
+  patches/ggml/0008-cpu-amx-q8_0-grouped-accumulate.patch
 
 This directory is generated from the upstream ggml tree at the SHA above, minus
 .github/, with the listed downstream patches applied in order. Do not edit it by
