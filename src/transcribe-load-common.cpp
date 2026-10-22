@@ -447,6 +447,10 @@ transcribe_status init_backends(transcribe_backend_request requested,
 // copied into a backend buffer otherwise.
 // ---------------------------------------------------------------------------
 
+namespace {
+constexpr double k_mib = 1024.0 * 1024.0;
+}  // namespace
+
 void WeightStorage::reset() noexcept {
     // Buffers before the mapping. A host-pointer buffer only wraps the pages
     // (its free never touches them), but it must not outlive them.
@@ -454,11 +458,95 @@ void WeightStorage::reset() noexcept {
     mapped_buffer_ = nullptr;
     safe_buffer_free(copy_buffer_);
     copy_buffer_ = nullptr;
+    for (ggml_backend_buffer_t b : repack_buffers_) {
+        safe_buffer_free(b);
+    }
+    repack_buffers_.clear();
     file_.reset();
 }
 
 bool WeightStorage::is_mapped(const ggml_tensor * t) const noexcept {
     return t != nullptr && mapped_buffer_ != nullptr && t->buffer == mapped_buffer_;
+}
+
+bool WeightStorage::is_repacked(const ggml_tensor * t) const noexcept {
+    if (t == nullptr || t->buffer == nullptr) {
+        return false;
+    }
+    return std::find(repack_buffers_.begin(), repack_buffers_.end(), t->buffer) != repack_buffers_.end();
+}
+
+transcribe_status WeightStorage::allocate_repacked(ggml_backend_buffer_type_t         buft,
+                                                   const std::vector<ggml_tensor *> & tensors,
+                                                   const char *                       error_tag) {
+    if (buft == nullptr || tensors.empty()) {
+        return TRANSCRIBE_OK;
+    }
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    size_t       total = 0;
+    for (const ggml_tensor * t : tensors) {
+        total += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, const_cast<ggml_tensor *>(t)), align);
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, total);
+    if (buffer == nullptr) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: cannot allocate %.1f MiB in %s", error_tag, total / k_mib,
+                ggml_backend_buft_name(buft));
+        return TRANSCRIBE_ERR_OOM;
+    }
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    repack_buffers_.push_back(buffer);  // owned from here, also on error
+    ggml_tallocr talloc = ggml_tallocr_new(buffer);
+    for (ggml_tensor * t : tensors) {
+        if (ggml_tallocr_alloc(&talloc, t) != GGML_STATUS_SUCCESS) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: %s rejected tensor \"%s\"", error_tag,
+                    ggml_backend_buft_name(buft), ggml_get_name(t));
+            return TRANSCRIBE_ERR_BACKEND;
+        }
+    }
+    return TRANSCRIBE_OK;
+}
+
+bool cpu_repack_allowed() {
+    return !env::flag("TRANSCRIBE_NO_CPU_REPACK");
+}
+
+ggml_backend_buffer_type_t cpu_repack_buft_for(ggml_backend_dev_t cpu_dev, ggml_tensor * w) {
+    if (cpu_dev == nullptr || w == nullptr || w->buffer != nullptr || w->data != nullptr || w->view_src != nullptr ||
+        ggml_n_dims(w) > 2) {
+        return nullptr;
+    }
+    auto get_extra = reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+        ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu_dev), "ggml_backend_dev_get_extra_bufts"));
+    ggml_backend_buffer_type_t * extra = get_extra != nullptr ? get_extra(cpu_dev) : nullptr;
+    if (extra == nullptr) {
+        return nullptr;
+    }
+
+    // The op a family runs: ggml_mul_mat(w, activations) with a multi-row
+    // activation. supports_op of an extra buffer type looks at the weight's
+    // buffer, so give `w` an empty buffer of each candidate type while asking.
+    ggml_init_params ip  = { 4 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context *   ctx = ggml_init(ip);
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor *              x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0], 512);
+    ggml_tensor *              op     = ggml_mul_mat(ctx, w, x);
+    ggml_backend_buffer_type_t chosen = nullptr;
+    for (; *extra != nullptr && chosen == nullptr; ++extra) {
+        ggml_backend_buffer_t probe = ggml_backend_buft_alloc_buffer(*extra, 0);
+        if (probe == nullptr) {
+            continue;
+        }
+        w->buffer = probe;
+        if (ggml_backend_dev_supports_op(cpu_dev, op)) {
+            chosen = *extra;
+        }
+        w->buffer = nullptr;
+        safe_buffer_free(probe);
+    }
+    ggml_free(ctx);
+    return chosen;
 }
 
 bool mmap_allowed(const transcribe_model_load_params * params) {
@@ -469,8 +557,6 @@ bool mmap_allowed(const transcribe_model_load_params * params) {
 }
 
 namespace {
-
-constexpr double k_mib = 1024.0 * 1024.0;
 
 // The primary device can keep weights in a wrapped host allocation. ggml says
 // so through buffer_from_host_ptr (CPU, Metal) and mmap_support (false for
@@ -640,11 +726,42 @@ transcribe_status allocate_weights(const std::string &                  path,
                                    const BackendPlan &                  plan,
                                    const transcribe_model_load_params * params,
                                    const char *                         error_tag,
-                                   WeightStorage &                      out) {
+                                   WeightStorage &                      out,
+                                   const MulMatWeights *                mul_mat_weights) {
     if (plan.primary == nullptr || gguf_data == nullptr || ctx_meta == nullptr) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
     ggml_backend_dev_t dev = ggml_backend_get_device(plan.primary);
+
+    // CPU extra buffer types first: their tensors then have storage, so the
+    // mapping and the copy buffer leave them alone.
+    if (mul_mat_weights != nullptr && !mul_mat_weights->empty() && plan.primary_kind == BackendKind::Cpu &&
+        cpu_repack_allowed()) {
+        std::vector<std::pair<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>>> groups;
+        for (ggml_tensor * t : *mul_mat_weights) {
+            ggml_backend_buffer_type_t buft = cpu_repack_buft_for(dev, t);
+            if (buft == nullptr) {
+                continue;
+            }
+            auto it = std::find_if(groups.begin(), groups.end(), [buft](const auto & g) { return g.first == buft; });
+            if (it == groups.end()) {
+                groups.push_back({ buft, {} });
+                it = groups.end() - 1;
+            }
+            it->second.push_back(t);
+        }
+        for (const auto & g : groups) {
+            if (const transcribe_status st = out.allocate_repacked(g.first, g.second, error_tag); st != TRANSCRIBE_OK) {
+                return st;
+            }
+            size_t bytes = 0;
+            for (const ggml_tensor * t : g.second) {
+                bytes += ggml_nbytes(t);
+            }
+            log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "%s: %zu matrix weights (%.1f MiB) in %s", error_tag, g.second.size(),
+                    bytes / k_mib, ggml_backend_buft_name(g.first));
+        }
+    }
 
     std::string why;
     MapCounts   counts;
@@ -701,8 +818,10 @@ transcribe_status load_weights(const std::string &                  path,
                                const BackendPlan &                  plan,
                                const transcribe_model_load_params * params,
                                const char *                         error_tag,
-                               WeightStorage &                      out) {
-    if (const transcribe_status st = allocate_weights(path, gguf_data, ctx_meta, plan, params, error_tag, out);
+                               WeightStorage &                      out,
+                               const MulMatWeights *                mul_mat_weights) {
+    if (const transcribe_status st =
+            allocate_weights(path, gguf_data, ctx_meta, plan, params, error_tag, out, mul_mat_weights);
         st != TRANSCRIBE_OK) {
         return st;
     }
@@ -757,9 +876,11 @@ transcribe_status stream_tensor_data(const std::string &   path,
         // Host buffers (the CPU) take the file bytes directly: no staging
         // copy. Everything else (Metal, Vulkan, CUDA, ...) is uploaded in
         // chunks through ggml_backend_tensor_set, which needs a buffer type
-        // that accepts partial writes: every default one does (ggml's CPU
-        // repack buffers would not, and assert).
-        if (t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+        // that accepts partial writes: every default one does. ggml's CPU
+        // repack buffers do not (they convert whole tensors), so those get a
+        // single write.
+        const bool whole = skip != nullptr && skip->is_repacked(t);
+        if (!whole && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
             fin.read(static_cast<char *>(t->data), static_cast<std::streamsize>(nbytes));
             if (!fin) {
                 log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: short read for tensor \"%s\" (%zu bytes)", error_tag, t->name,
@@ -769,7 +890,7 @@ transcribe_status stream_tensor_data(const std::string &   path,
             continue;
         }
 
-        const size_t chunk = std::min(nbytes, k_stage_chunk);
+        const size_t chunk = whole ? nbytes : std::min(nbytes, k_stage_chunk);
         if (staging.size() < chunk) {
             staging.resize(chunk);
         }
@@ -882,6 +1003,85 @@ transcribe_status promote_conv_pw_f16_to_f32_on_cpu(const BackendPlan &         
             "%s: promoted %zu conv pointwise weights from F16 → F32 "
             "for CPU backend",
             error_tag, slots.size());
+    return TRANSCRIBE_OK;
+}
+
+transcribe_status quantize_conv_pw_for_cpu_repack(const BackendPlan &                plan,
+                                                  const std::vector<ConvPwF32Slot> & slots,
+                                                  bool                               direct_pw,
+                                                  const char *                       error_tag,
+                                                  ggml_context **                    out_ctx,
+                                                  WeightStorage &                    storage,
+                                                  bool *                             done) {
+    *done = false;
+    if (plan.primary_kind != BackendKind::Cpu || plan.primary == nullptr || slots.empty() || !direct_pw ||
+        !cpu_repack_allowed() || !env::flag("TRANSCRIBE_CPU_CONV_PW_Q8_0")) {
+        return TRANSCRIBE_OK;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(plan.primary);
+
+    ggml_init_params params = { slots.size() * ggml_tensor_overhead() + 256, nullptr, true };
+    ggml_context *   ctx    = ggml_init(params);
+    if (ctx == nullptr) {
+        return TRANSCRIBE_ERR_OOM;
+    }
+
+    // Every slot must convert, all into one buffer type; otherwise leave
+    // them all to the caller's usual path.
+    std::vector<ggml_tensor *> replacements;
+    replacements.reserve(slots.size());
+    ggml_backend_buffer_type_t buft = nullptr;
+    for (const auto & sl : slots) {
+        const ggml_tensor * src = sl.src;
+        const int64_t       K   = src->ne[1];
+        const int64_t       N   = src->ne[2];
+        if ((src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_F32) || src->ne[0] != 1 || src->ne[3] != 1 ||
+            K % ggml_blck_size(GGML_TYPE_Q8_0) != 0) {
+            ggml_free(ctx);
+            return TRANSCRIBE_OK;
+        }
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, N);
+        ggml_set_name(r, src->name);
+        ggml_backend_buffer_type_t b = cpu_repack_buft_for(dev, r);
+        if (b == nullptr || (buft != nullptr && b != buft)) {
+            ggml_free(ctx);
+            return TRANSCRIBE_OK;
+        }
+        buft = b;
+        replacements.push_back(r);
+    }
+
+    if (const transcribe_status st = storage.allocate_repacked(buft, replacements, error_tag); st != TRANSCRIBE_OK) {
+        ggml_free(ctx);
+        return st;
+    }
+
+    std::vector<uint8_t> raw;
+    std::vector<float>   f32;
+    std::vector<uint8_t> q8;
+    const auto *         f16_traits = ggml_get_type_traits(GGML_TYPE_F16);
+    for (size_t i = 0; i < slots.size(); ++i) {
+        ggml_tensor * src    = slots[i].src;
+        ggml_tensor * dst    = replacements[i];
+        const int64_t n_elem = ggml_nelements(src);
+        raw.resize(ggml_nbytes(src));
+        f32.resize(static_cast<size_t>(n_elem));
+        q8.resize(ggml_nbytes(dst));
+        ggml_backend_tensor_get(src, raw.data(), 0, raw.size());
+        if (src->type == GGML_TYPE_F16) {
+            f16_traits->to_float(raw.data(), f32.data(), n_elem);
+        } else {
+            std::memcpy(f32.data(), raw.data(), raw.size());
+        }
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, f32.data(), q8.data(), 0, dst->ne[1], dst->ne[0], nullptr);
+        ggml_backend_tensor_set(dst, q8.data(), 0, q8.size());  // whole: the repack buffer converts it
+        *slots[i].dst_slot = dst;
+    }
+
+    *out_ctx = ctx;
+    *done    = true;
+    log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "%s: quantized %zu conv pointwise weights to Q8_0 in %s", error_tag,
+            slots.size(), ggml_backend_buft_name(buft));
     return TRANSCRIBE_OK;
 }
 

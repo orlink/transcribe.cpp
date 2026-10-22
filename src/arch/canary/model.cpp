@@ -5,6 +5,7 @@
 // Transformer decoder, driven by a 4/5-slot multitask prompt.
 
 #include "canary.h"
+#include "conformer/conformer.h"
 #include "decoder.h"
 #include "encoder.h"
 #include "ggml-alloc.h"
@@ -327,7 +328,9 @@ transcribe_status fuse_batch_norm(CanaryModel & m) {
 }
 
 // On CPU primary backend, dequantize 1x1 conformer pointwise convs
-// from F16 to F32. Same rationale as parakeet/cohere.
+// from F16 to F32. Same rationale as parakeet/cohere. With
+// TRANSCRIBE_CPU_CONV_PW_Q8_0 on and a CPU matrix buffer type available,
+// quantize them to Q8_0 in that buffer type instead.
 transcribe_status promote_conv_pw_to_f32_on_cpu(CanaryModel & m) {
     std::vector<load_common::ConvPwF32Slot> slots;
     slots.reserve(m.weights.blocks.size() * 2);
@@ -339,8 +342,44 @@ transcribe_status promote_conv_pw_to_f32_on_cpu(CanaryModel & m) {
             slots.push_back({ &b.conv_pw2_w, b.conv_pw2_w });
         }
     }
+    bool quantized = false;
+    if (const transcribe_status st =
+            load_common::quantize_conv_pw_for_cpu_repack(m.plan, slots, conformer::detect_direct_pw(m.backend.c_str()),
+                                                         "canary", &m.conv_pw_f32_ctx, m.weight_storage, &quantized);
+        st != TRANSCRIBE_OK || quantized) {
+        return st;
+    }
     return load_common::promote_conv_pw_f16_to_f32_on_cpu(m.plan, slots, "canary", &m.conv_pw_f32_ctx,
                                                           &m.conv_pw_f32_buffer);
+}
+
+// Weights the graphs use only as the first operand of ggml_mul_mat (see
+// load_common::MulMatWeights). Not the token / position embeddings
+// (ggml_get_rows), the convolution kernels, or the 1x1 conv weights, which
+// are F16 in the file and converted after the load.
+load_common::MulMatWeights canary_mul_mat_weights(CanaryWeights & w) {
+    load_common::MulMatWeights out;
+    auto                       add = [&out](ggml_tensor * t) {
+        if (t != nullptr) {
+            out.push_back(t);
+        }
+    };
+    add(w.pre_encode.out_w);
+    for (auto & b : w.blocks) {
+        for (ggml_tensor * t : { b.ff1_lin1_w, b.ff1_lin2_w, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_out_w,
+                                 b.attn_pos_w, b.ff2_lin1_w, b.ff2_lin2_w }) {
+            add(t);
+        }
+    }
+    add(w.enc_proj.weight);
+    for (auto & b : w.dec_blocks) {
+        for (ggml_tensor * t : { b.self_q_w, b.self_k_w, b.self_v_w, b.self_o_w, b.cross_q_w, b.cross_k_w, b.cross_v_w,
+                                 b.cross_o_w, b.ffn_up_w, b.ffn_down_w }) {
+            add(t);
+        }
+    }
+    add(w.head.weight);
+    return out;
 }
 
 constexpr const char k_default_variant[] = "canary";
@@ -499,8 +538,9 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     m->backend         = ggml_backend_name(m->plan.primary);
     m->primary_backend = m->plan.primary;
 
+    const transcribe::load_common::MulMatWeights mul_mat_weights = canary_mul_mat_weights(m->weights);
     if (const transcribe_status st = transcribe::load_common::load_weights(
-            loader.path(), gguf_data, m->ctx_meta, m->plan, params, "canary", m->weight_storage);
+            loader.path(), gguf_data, m->ctx_meta, m->plan, params, "canary", m->weight_storage, &mul_mat_weights);
         st != TRANSCRIBE_OK) {
         gguf_free(gguf_data);
         return st;

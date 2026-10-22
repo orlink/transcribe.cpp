@@ -29,6 +29,8 @@ struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
 struct ggml_backend_buffer;
 typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
+struct ggml_backend_buffer_type;
+typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
 struct ggml_backend_device;
 typedef struct ggml_backend_device * ggml_backend_dev_t;
 struct ggml_context;
@@ -96,6 +98,12 @@ transcribe_status init_backends(transcribe_backend_request requested,
 // fuse_batch_norm and promote_conv_pw_f16_to_f32_on_cpu do. A family should
 // never write a ctx_meta tensor after load anyway: weights are shared by
 // every session on the model.
+//
+// On a CPU primary, weights the family lists as matrix-multiply-only (see
+// MulMatWeights) may instead live in one of ggml-cpu's extra buffer types
+// (`repack_buffers`): AMX on x86 CPUs with AMX, the repack types on others.
+// Those buffers keep the data in their kernels' own layout, so nothing but
+// that buffer type's ggml_mul_mat may read it.
 class WeightStorage {
   public:
     WeightStorage() = default;
@@ -115,6 +123,18 @@ class WeightStorage {
     // True when `t`'s data lives in the file mapping.
     bool is_mapped(const ggml_tensor * t) const noexcept;
 
+    // True when `t` lives in a CPU repack buffer. Such a tensor must be
+    // written whole, in one ggml_backend_tensor_set call.
+    bool is_repacked(const ggml_tensor * t) const noexcept;
+
+    // Allocate `tensors` (none may have storage yet) in a new buffer of the
+    // CPU extra buffer type `buft`, owned by this storage. For load-time
+    // replacements (quantize_conv_pw_for_cpu_repack). Fill each tensor with
+    // one whole ggml_backend_tensor_set afterwards.
+    transcribe_status allocate_repacked(ggml_backend_buffer_type_t         buft,
+                                        const std::vector<ggml_tensor *> & tensors,
+                                        const char *                       error_tag);
+
   private:
     friend transcribe_status allocate_weights(const std::string &                  path,
                                               const gguf_context *                 gguf_data,
@@ -122,16 +142,36 @@ class WeightStorage {
                                               const BackendPlan &                  plan,
                                               const transcribe_model_load_params * params,
                                               const char *                         error_tag,
-                                              WeightStorage &                      out);
+                                              WeightStorage &                      out,
+                                              const std::vector<ggml_tensor *> *   mul_mat_weights);
     friend transcribe_status allocate_copied_weights(ggml_context *      ctx_meta,
                                                      const BackendPlan & plan,
                                                      const char *        error_tag,
                                                      WeightStorage &     out);
 
-    MappedFile            file_;
-    ggml_backend_buffer_t mapped_buffer_ = nullptr;
-    ggml_backend_buffer_t copy_buffer_   = nullptr;
+    MappedFile                         file_;
+    ggml_backend_buffer_t              mapped_buffer_ = nullptr;
+    ggml_backend_buffer_t              copy_buffer_   = nullptr;
+    std::vector<ggml_backend_buffer_t> repack_buffers_;
 };
+
+// Weights a family uses only as the first operand of ggml_mul_mat (directly
+// or through a reshape that keeps them whole and contiguous): never in
+// ggml_get_rows, an element-wise op, a convolution kernel, or a host read.
+// Passing them to allocate_weights / load_weights lets a CPU primary store
+// them in ggml-cpu's extra buffer types, whose matrix kernels (AMX tiles,
+// AVX512-VNNI rows, the ARM/x86 repacks) need their own data layout. A
+// tensor listed here but used any other way computes garbage.
+using MulMatWeights = std::vector<ggml_tensor *>;
+
+// Whether CPU extra buffer types may be used: false when the
+// TRANSCRIBE_NO_CPU_REPACK environment flag is on.
+bool cpu_repack_allowed();
+
+// The first of the CPU device's extra buffer types whose ggml_mul_mat
+// accepts `w` (2-D, no storage yet) as its weight, or nullptr. Only
+// meaningful when plan.primary_kind == BackendKind::Cpu.
+ggml_backend_buffer_type_t cpu_repack_buft_for(ggml_backend_dev_t cpu_dev, ggml_tensor * w);
 
 // Whether a load may memory-map weights: false when params->no_mmap is set
 // or the TRANSCRIBE_NO_MMAP environment flag is on. `params` may be NULL
@@ -154,6 +194,11 @@ bool mmap_allowed(const transcribe_model_load_params * params);
 // Follow with stream_tensor_data(..., &out) (or a family streamer that skips
 // out.is_mapped(t)) to fill the copied tensors. load_weights does both.
 //
+// mul_mat_weights (optional): see MulMatWeights. On a CPU primary, unless
+// TRANSCRIBE_NO_CPU_REPACK is set, each listed tensor that a CPU extra
+// buffer type supports goes into that buffer type (filled by the stream,
+// which repacks it); the rest are mapped or copied as usual.
+//
 // Returns TRANSCRIBE_OK, TRANSCRIBE_ERR_OOM when the copy buffer cannot be
 // allocated, or TRANSCRIBE_ERR_BACKEND when the device rejects a mapped
 // tensor. On error `out` may hold partial storage; the caller discards the
@@ -164,7 +209,8 @@ transcribe_status allocate_weights(const std::string &                  path,
                                    const BackendPlan &                  plan,
                                    const transcribe_model_load_params * params,
                                    const char *                         error_tag,
-                                   WeightStorage &                      out);
+                                   WeightStorage &                      out,
+                                   const MulMatWeights *                mul_mat_weights = nullptr);
 
 // Allocate every still-unallocated tensor in `ctx_meta` in an ordinary
 // buffer on plan.primary (no mapping). For loaders whose weights are not
@@ -177,7 +223,7 @@ transcribe_status allocate_copied_weights(ggml_context *      ctx_meta,
 // Stream tensor data from the GGUF data section on disk into
 // already-allocated backend buffer slots: read straight into host buffers,
 // uploaded through ggml_backend_tensor_set in bounded (16 MiB) chunks
-// otherwise. Tensors that `skip` maps are left alone (they already hold the
+// otherwise, and in one whole write for tensors `skip` reports repacked. Tensors that `skip` maps are left alone (they already hold the
 // file bytes); with skip == nullptr every tensor in ctx_meta is streamed.
 //
 //   path:      filesystem path to the GGUF file, reopened fresh via
@@ -208,7 +254,8 @@ transcribe_status load_weights(const std::string &                  path,
                                const BackendPlan &                  plan,
                                const transcribe_model_load_params * params,
                                const char *                         error_tag,
-                               WeightStorage &                      out);
+                               WeightStorage &                      out,
+                               const MulMatWeights *                mul_mat_weights = nullptr);
 
 // A single F16 → F32 promotion target: `dst_slot` is a pointer into a
 // family weights struct (e.g. &block.conv_pw1_w) that currently holds
@@ -249,6 +296,27 @@ transcribe_status promote_conv_pw_f16_to_f32_on_cpu(const BackendPlan &         
                                                     const char *                       error_tag,
                                                     ggml_context **                    out_ctx,
                                                     ggml_backend_buffer_t *            out_buffer);
+
+// Alternative to promote_conv_pw_f16_to_f32_on_cpu for CPU primaries with a
+// matrix-multiply extra buffer type: quantize each pointwise-conv weight
+// ([1, K, N] F16 or F32) to a 2-D Q8_0 [K, N] replacement stored in that
+// buffer type, so the 1x1 convs run on the same kernels as the linear
+// layers. Opt-in, because it changes the numbers (F16 -> Q8_0): only when
+// the TRANSCRIBE_CPU_CONV_PW_Q8_0 environment flag is on and
+// cpu_repack_allowed(). Requires the family's direct pointwise path
+// (ggml_mul_mat on a 2-D reshape of the weight), so pass direct_pw.
+//
+// Returns TRANSCRIBE_OK and sets *done = true when every slot was replaced
+// (each *dst_slot repointed, the replacements owned by `storage`); with
+// *done == false nothing was changed and the caller falls back to its usual
+// path (e.g. the F32 promotion). Errors: TRANSCRIBE_ERR_OOM.
+transcribe_status quantize_conv_pw_for_cpu_repack(const BackendPlan &                plan,
+                                                  const std::vector<ConvPwF32Slot> & slots,
+                                                  bool                               direct_pw,
+                                                  const char *                       error_tag,
+                                                  ggml_context **                    out_ctx,
+                                                  WeightStorage &                    storage,
+                                                  bool *                             done);
 
 // Read a small F32 tensor from the GGUF file into a std::vector<float>.
 //
