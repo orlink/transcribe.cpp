@@ -4076,6 +4076,58 @@ static void ggml_compute_forward_norm_f32(
     }
 }
 
+// NORM -> MUL(w) -> ADD(b) on f32 rows, with w and b a single row each. Each row is normalized as in
+// ggml_compute_forward_norm_f32, then scaled and shifted by the separate loops the MUL and ADD nodes
+// would run, so every element is rounded after every operation as before.
+void ggml_compute_forward_norm_mul_add_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst_norm,
+        ggml_tensor * dst_mul,
+        ggml_tensor * dst_add) {
+
+    const ggml_tensor * src0 = dst_norm->src[0];
+    const ggml_tensor * w    = dst_mul->src[0] == dst_norm ? dst_mul->src[1] : dst_mul->src[0];
+    const ggml_tensor * b    = dst_add->src[0] == dst_mul  ? dst_add->src[1] : dst_add->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst_add->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && dst_add->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
+
+    const float * wf = (const float *) w->data;
+    const float * bf = (const float *) b->data;
+
+    float eps;
+    memcpy(&eps, dst_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const float * xf = (const float *) ((const char *) src0->data + i01*src0->nb[1] + i02*src0->nb[2] + i03*src0->nb[3]);
+                float       * yf = (float *) ((char *) dst_add->data + i01*dst_add->nb[1] + i02*dst_add->nb[2] + i03*dst_add->nb[3]);
+
+                float sum = 0.0;
+                ggml_vec_sum_f32(ne00, &sum, xf);
+                const float mean = sum/ne00;
+
+                const float variance = ggml_vec_cvar_f32(ne00, yf, xf, mean);
+                const float scale    = 1.0f/sqrtf(variance + eps);
+                ggml_vec_scale_f32(ne00, yf, scale);
+
+                ggml_vec_mul_f32(ne00, yf, yf, wf);
+                ggml_vec_add_f32(ne00, yf, yf, bf);
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_norm(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

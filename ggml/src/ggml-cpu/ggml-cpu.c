@@ -3111,6 +3111,26 @@ static int ggml_cpu_try_fuse_ops(
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
 
+    if (node->op == GGML_OP_NORM) {
+        // NORM + MUL + ADD (layer norm with weight and bias)
+        const enum ggml_op fuse_ops[] = { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD };
+        if (ggml_can_fuse(cgraph, node_n, fuse_ops, 3)) {
+            struct ggml_tensor * mul_node = cgraph->nodes[node_n + 1];
+            struct ggml_tensor * add_node = cgraph->nodes[node_n + 2];
+            const struct ggml_tensor * w = (mul_node->src[0] == node) ? mul_node->src[1] : mul_node->src[0];
+            const struct ggml_tensor * b = (add_node->src[0] == mul_node) ? add_node->src[1] : add_node->src[0];
+            if (node->src[0]->type == GGML_TYPE_F32 && node->src[0]->nb[0] == sizeof(float) &&
+                mul_node->type == GGML_TYPE_F32 && add_node->type == GGML_TYPE_F32 &&
+                add_node->nb[0] == sizeof(float) &&
+                w->type == GGML_TYPE_F32 && ggml_nrows(w) == 1 && w->ne[0] == node->ne[0] && w->nb[0] == sizeof(float) &&
+                b->type == GGML_TYPE_F32 && ggml_nrows(b) == 1 && b->ne[0] == node->ne[0] && b->nb[0] == sizeof(float)) {
+
+                ggml_compute_forward_norm_mul_add_fused(params, node, mul_node, add_node);
+                return 2;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
         const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
