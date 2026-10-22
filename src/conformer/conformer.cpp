@@ -837,11 +837,16 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
     };
 
     // A full-attention flash mask has an independent relative-position
-    // matmul for each head. Build and narrow those one head at a time so
-    // the allocator never needs the [2*T-1, T, H] F32 result at once.
+    // matmul for each head. For long inputs, build and narrow those one head
+    // at a time so the allocator never needs the [2*T-1, T, H] F32 result at
+    // once; below kSplitMaskBytes the batched form computes the same values
+    // with a few nodes instead of about five per head.
     // Masked/local cases retain the common path below.
-    const bool    split_flash_mask = flash && !is_local && !is_chunked && params.attn_pad_mask == nullptr;
-    ggml_tensor * matrix_bd        = nullptr;
+    constexpr size_t kSplitMaskBytes = size_t(64) << 20;
+    const size_t     mask_f32_bytes  = static_cast<size_t>(pos_len) * T_q * n_head * B * sizeof(float);
+    const bool       split_flash_mask =
+        flash && !is_local && !is_chunked && params.attn_pad_mask == nullptr && mask_f32_bytes > kSplitMaskBytes;
+    ggml_tensor * matrix_bd = nullptr;
     if (split_flash_mask) {
         for (int h = 0; h < n_head; ++h) {
             ggml_tensor * p_h       = ggml_view_4d(ctx, p, head_dim, pos_len, 1, 1, p->nb[1], p->nb[2], p->nb[3],
