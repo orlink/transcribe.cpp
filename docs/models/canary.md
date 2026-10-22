@@ -81,3 +81,24 @@ All Canary variants support:
 What's not supported (consistent across the family): real-time
 streaming, VAD, speaker diarization, auto language detection. See the
 family doc for the full runtime contract.
+
+## Draft transcript
+
+When a first transcript of the same audio is already at hand (for example
+from a faster streaming recognizer), pass it as the draft of the Canary run
+extension in `include/transcribe/canary.h`:
+
+```c
+struct transcribe_canary_run_ext ext;
+transcribe_canary_run_ext_init(&ext);
+ext.draft = first_pass_text;
+run_params.family = &ext.ext;
+```
+
+On the CPU backend the decoder then appends up to `draft_max` (default 8)
+draft tokens to each decoder pass and keeps those that equal its own greedy
+choice. The transcript is the same as without a draft; only the number of
+decoder passes drops. On dictation clips with the text of a separate
+streaming recognizer as the draft, decoding took about 40% less time. The
+draft is ignored on other backends and for inputs of 512 or more encoder
+frames (about 41 s).

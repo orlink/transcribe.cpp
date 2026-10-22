@@ -354,7 +354,8 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
                                     int                   n_past,
                                     int                   T_enc,
                                     bool                  skip_log_softmax,
-                                    bool                  use_flash) {
+                                    bool                  use_flash,
+                                    bool                  argmax_all_rows) {
     DecoderBuild db{};
 
     if (ctx == nullptr || n_tokens <= 0 || T_enc <= 0) {
@@ -500,7 +501,7 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
 
     if (skip_log_softmax) {
         ggml_tensor * last_logits = logits;
-        if (n_tokens > 1) {
+        if (n_tokens > 1 && !argmax_all_rows) {
             const int64_t vocab     = logits->ne[0];
             const size_t  row_bytes = ggml_element_size(logits) * vocab;
             last_logits             = ggml_view_2d(ctx, logits, vocab, /*n=*/1, row_bytes, row_bytes * (n_tokens - 1));

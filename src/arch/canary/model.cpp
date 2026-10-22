@@ -26,6 +26,7 @@
 #include "transcribe-meta.h"
 #include "transcribe-prompting.h"
 #include "transcribe-repetition-guard.h"
+#include "transcribe/canary.h"
 #include "weights.h"
 
 #include <algorithm>
@@ -1044,6 +1045,26 @@ transcribe_status run(transcribe_session *          session,
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
     const int prompt_len = static_cast<int>(prompt_ids.size());
+
+    // Optional draft transcript (transcribe_canary_run_ext); see the draft
+    // checking loop below. A draft that does not encode is dropped.
+    std::vector<int32_t> draft_ids;
+    int                  draft_max = 0;
+    if (params != nullptr && params->family != nullptr) {
+        if (const transcribe_status st = transcribe_ext_check(params->family, TRANSCRIBE_EXT_KIND_CANARY_RUN,
+                                                              sizeof(struct transcribe_canary_run_ext));
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        const auto * ext = reinterpret_cast<const transcribe_canary_run_ext *>(params->family);
+        if (ext->draft != nullptr && ext->draft[0] != '\0') {
+            if (encode_canary2_prefix(*cm, ext->draft, tgt_lang, draft_ids) != TRANSCRIBE_OK) {
+                log_msg(TRANSCRIBE_LOG_LEVEL_WARN, "canary run: the draft does not encode; decoding without it");
+                draft_ids.clear();
+            }
+            draft_max = ext->draft_max > 0 ? std::min(ext->draft_max, 32) : 8;
+        }
+    }
     // Backstop for run_validate's pre-clear bound: never prefill past the KV.
     if (const transcribe_status st = check_prompt_fits(prompt_len, canary_context_ceiling(cc->n_ctx, cm->hparams));
         st != TRANSCRIBE_OK) {
@@ -1434,7 +1455,155 @@ transcribe_status run(transcribe_session *          session,
                 }
             }
 
-            for (int step = 1; step < max_tokens && next_token != eos_id; ++step) {
+            // Draft checking. A pass consumes next_token plus up to draft_max
+            // draft tokens and returns the greedy choice after each of them;
+            // the drafts that equal the choice before them are kept, then the
+            // first differing choice. Every kept token is the one a step
+            // would have produced: each row of the pass takes the same CPU
+            // kernels as a one-token step (AMX rows are independent; fewer
+            // than 64 queries keep flash attention on its per-row path) as
+            // long as no attention reaches kSpecMaxKeys keys, where a
+            // one-token step splits the keys across threads instead.
+            constexpr int kSpecMaxKeys = 512;
+            const bool    spec         = !draft_ids.empty() && T_enc < kSpecMaxKeys;
+            if (spec) {
+                draft_ids.push_back(eos_id);
+            }
+            int                  draft_pos = 0;  // draft index the decode is believed to have reached
+            std::vector<int32_t> proposal;
+            // The draft continuation after the first place in
+            // [draft_pos - 8, draft_pos + 16) where the draft matches the last
+            // three decoded tokens (else two, else one).
+            auto                 propose = [&]() {
+                proposal.clear();
+                const int n_draft = static_cast<int>(draft_ids.size());
+                const int n_gen   = static_cast<int>(generated_ids.size());
+                const int lo      = std::max(0, draft_pos - 8);
+                const int hi      = std::min(n_draft, draft_pos + 16);
+                int       start   = -1;
+                for (int n = std::min(3, n_gen); n >= 1 && start < 0; --n) {
+                    for (int j = lo; j + n <= hi; ++j) {
+                        if (std::equal(draft_ids.begin() + j, draft_ids.begin() + j + n, generated_ids.end() - n)) {
+                            start = j + n;
+                            break;
+                        }
+                    }
+                }
+                if (start < 0) {
+                    return;
+                }
+                const int room = std::min(draft_max, max_tokens - n_gen);
+                for (int j = start; j < n_draft && static_cast<int>(proposal.size()) < room; ++j) {
+                    proposal.push_back(draft_ids[j]);
+                }
+                draft_pos = start;
+            };
+            std::vector<int32_t> pass_tokens;
+            std::vector<int32_t> pass_pos;
+            std::vector<int32_t> pass_ids;
+            std::vector<float>   pass_mask;
+            bool                 spec_done = false;
+
+            while (spec && !spec_done && next_token != eos_id && static_cast<int>(generated_ids.size()) < max_tokens) {
+                if (cc->poll_abort()) {
+                    commit_result();
+                    return TRANSCRIBE_ERR_ABORTED;
+                }
+                if (n_past + 1 > cc->kv_cache.n_ctx) {
+                    transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_WARN, "canary run: KV cache full at n_past=%d", n_past);
+                    break;
+                }
+                propose();
+                int n_tok = 1 + static_cast<int>(proposal.size());
+                if (n_past + n_tok > cc->kv_cache.n_ctx || n_past + n_tok >= kSpecMaxKeys) {
+                    proposal.clear();
+                    n_tok = 1;
+                }
+
+                if (!new_compute_ctx(4 * 1024 * 1024)) {
+                    log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: decoder step ggml_init failed");
+                    commit_result();
+                    return TRANSCRIBE_ERR_OOM;
+                }
+                DecoderBuild db_pass = build_decoder_graph_kv(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache,
+                                                              n_tok, n_past, T_enc, /*skip_log_softmax=*/true,
+                                                              cc->decoder_use_flash, /*argmax_all_rows=*/true);
+                if (db_pass.out == nullptr || db_pass.graph == nullptr) {
+                    log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: decoder draft-pass graph build failed");
+                    commit_result();
+                    return TRANSCRIBE_ERR_GGUF;
+                }
+                ggml_backend_sched_reset(cc->sched);
+                if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(cc->sched, db_pass.graph, "canary")) {
+                    transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                                        "canary run: draft-pass graph allocation failed — out of memory.");
+                    commit_result();
+                    return TRANSCRIBE_ERR_OOM;
+                }
+                pass_tokens.assign(1, next_token);
+                pass_tokens.insert(pass_tokens.end(), proposal.begin(), proposal.end());
+                pass_pos.resize(n_tok);
+                for (int i = 0; i < n_tok; ++i) {
+                    pass_pos[i] = n_past + i;
+                }
+                ggml_backend_tensor_set(db_pass.token_ids_in, pass_tokens.data(), 0, n_tok * sizeof(int32_t));
+                ggml_backend_tensor_set(db_pass.pos_ids_in, pass_pos.data(), 0, n_tok * sizeof(int32_t));
+                if (n_tok > 1) {
+                    ggml_tensor * mask_input = find_mask_input();
+                    if (mask_input == nullptr) {
+                        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: draft-pass graph has no causal mask");
+                        commit_result();
+                        return TRANSCRIBE_ERR_GGUF;
+                    }
+                    // row i (position n_past + i) sees keys 0 .. n_past + i;
+                    // the rest are skipped like keys a step does not have
+                    const int n_kv = n_past + n_tok;
+                    pass_mask.assign(static_cast<size_t>(n_kv) * n_tok, -INFINITY);
+                    for (int i = 0; i < n_tok; ++i) {
+                        std::fill(pass_mask.begin() + static_cast<size_t>(i) * n_kv,
+                                  pass_mask.begin() + static_cast<size_t>(i) * n_kv + n_past + i + 1, 0.0f);
+                    }
+                    ggml_backend_tensor_set(mask_input, pass_mask.data(), 0, pass_mask.size() * sizeof(float));
+                }
+                if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, db_pass.graph);
+                    gs != GGML_STATUS_SUCCESS) {
+                    log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: decoder draft-pass compute failed (%d)",
+                            static_cast<int>(gs));
+                    commit_result();
+                    return TRANSCRIBE_ERR_BACKEND;
+                }
+                pass_ids.resize(n_tok);
+                ggml_backend_tensor_get(db_pass.argmax_out, pass_ids.data(), 0, n_tok * sizeof(int32_t));
+
+                int n_ok = 0;
+                while (n_ok < static_cast<int>(proposal.size()) && pass_ids[n_ok] == proposal[n_ok]) {
+                    ++n_ok;
+                }
+                n_past += n_ok + 1;
+                cc->kv_cache.n    = n_past;
+                cc->kv_cache.head = n_past;
+                draft_pos += n_ok;
+
+                for (int j = 0; j <= n_ok; ++j) {
+                    next_token = pass_ids[j];
+                    if (next_token == eos_id) {
+                        break;
+                    }
+                    generated_ids.push_back(next_token);
+                    if (transcribe::stop_on_repetition(generated_ids, "canary run")) {
+                        cc->mark_repetition_stop();
+                        repeating = true;
+                        spec_done = true;
+                        break;
+                    }
+                    if (static_cast<int>(generated_ids.size()) >= max_tokens) {
+                        spec_done = true;
+                        break;
+                    }
+                }
+            }
+
+            for (int step = 1; !spec && step < max_tokens && next_token != eos_id; ++step) {
                 if (cc->poll_abort()) {
                     commit_result();
                     return TRANSCRIBE_ERR_ABORTED;
@@ -1976,6 +2145,13 @@ transcribe_status run_batch(transcribe_session *          session,
 // target language's tokenizer and the prompt it extends must fit the decoder
 // context, checked before the dispatcher clears the previous result.
 transcribe_status run_validate(const transcribe_session * session, const transcribe_run_params * params) {
+    if (params != nullptr && params->family != nullptr) {
+        if (const transcribe_status st = transcribe_ext_check(params->family, TRANSCRIBE_EXT_KIND_CANARY_RUN,
+                                                              sizeof(struct transcribe_canary_run_ext));
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+    }
     if (session == nullptr || session->model == nullptr || params == nullptr || params->prefix == nullptr) {
         return TRANSCRIBE_OK;
     }
@@ -1993,6 +2169,11 @@ transcribe_status run_validate(const transcribe_session * session, const transcr
                              canary_context_ceiling(session->n_ctx, cm->hparams));
 }
 
+// The run slot takes the draft extension (transcribe/canary.h).
+bool accepts_ext_kind(const transcribe_model * /*model*/, transcribe_ext_slot slot, uint32_t kind) {
+    return slot == TRANSCRIBE_EXT_SLOT_RUN && kind == TRANSCRIBE_EXT_KIND_CANARY_RUN;
+}
+
 }  // namespace
 
 extern const Arch arch = {
@@ -2006,8 +2187,17 @@ extern const Arch arch = {
     /* .stream_feed      = */ nullptr,
     /* .stream_finalize  = */ nullptr,
     /* .stream_reset     = */ nullptr,
-    /* .accepts_ext_kind = */ nullptr,
+    /* .accepts_ext_kind = */ accepts_ext_kind,
     /* .run_validate     = */ run_validate,
 };
 
 }  // namespace transcribe::canary
+
+extern "C" void transcribe_canary_run_ext_init(struct transcribe_canary_run_ext * p) {
+    if (p == nullptr) {
+        return;
+    }
+    std::memset(p, 0, sizeof(*p));
+    p->ext.size = sizeof(*p);
+    p->ext.kind = TRANSCRIBE_EXT_KIND_CANARY_RUN;
+}

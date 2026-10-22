@@ -357,6 +357,15 @@ static void test_init_macros(void) {
     CHECK(wtr.t1_ms == 0);
     CHECK(wtr.n_fallbacks == 0);
 
+    /* Canary run extension: kind + size wired by the init function, no
+     * draft by default. */
+    struct transcribe_canary_run_ext crx;
+    transcribe_canary_run_ext_init(&crx);
+    CHECK(crx.ext.size == sizeof(struct transcribe_canary_run_ext));
+    CHECK(crx.ext.kind == TRANSCRIBE_EXT_KIND_CANARY_RUN);
+    CHECK(crx.draft == NULL);
+    CHECK(crx.draft_max == 0);
+
     /* Whisper run extension: kind + size wired by the init function,
      * and the field defaults match the family's shipping recipe. */
     struct transcribe_whisper_run_ext wrx;
