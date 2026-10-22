@@ -188,6 +188,10 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
             }
             if (cpu_ctx->owned_threadpool == NULL) {
                 struct ggml_threadpool_params tpp = ggml_threadpool_params_default(cpu_ctx->n_threads);
+                // workers sleep as soon as a graph is done instead of spinning for the default
+                // poll period, which would compete with the caller's own work between graphs
+                const char * poll = getenv("GGML_CPU_THREADPOOL_POLL");
+                tpp.poll = poll ? atoi(poll) : 0;
                 cpu_ctx->owned_threadpool = ggml_threadpool_new(&tpp);
                 cpu_ctx->owned_n_threads  = cpu_ctx->n_threads;
             }
