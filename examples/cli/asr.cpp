@@ -4,6 +4,7 @@
 
 #include "cli.h"
 #include "transcribe.h"
+#include "transcribe/canary.h"
 #include "transcribe/parakeet.h"
 #include "transcribe/voxtral_realtime.h"
 #include "transcribe/whisper.h"
@@ -755,6 +756,16 @@ int run_asr_file(const cli_args &           args,
         if (transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_RUN, TRANSCRIBE_EXT_KIND_WHISPER_RUN)) {
             rp.family = &wx.ext;
         }
+    }
+
+    // Canary run extension: a draft transcript the decoder checks in
+    // batched passes (the output is the same as without it).
+    struct transcribe_canary_run_ext cx;
+    transcribe_canary_run_ext_init(&cx);
+    if (!args.draft.empty() &&
+        transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_RUN, TRANSCRIBE_EXT_KIND_CANARY_RUN)) {
+        cx.draft  = args.draft.c_str();
+        rp.family = &cx.ext;
     }
 
     if (args.keep_special_tags) {

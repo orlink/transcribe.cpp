@@ -311,6 +311,19 @@ transcribe_apply_warnings(transcribe_repetition_guard_unit)
 add_test(NAME transcribe_repetition_guard_unit COMMAND transcribe_repetition_guard_unit)
 
 # -----------------------------------------------------------------------------
+# Draft cursor for draft-verified greedy decoding (pure host, no model)
+
+add_executable(transcribe_draft_cursor_unit
+    draft_cursor_unit.cpp)
+
+target_include_directories(transcribe_draft_cursor_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_draft_cursor_unit)
+
+add_test(NAME transcribe_draft_cursor_unit COMMAND transcribe_draft_cursor_unit)
+
+# -----------------------------------------------------------------------------
 # MOSS diarized-transcript parser unit test (pure host, no model)
 # -----------------------------------------------------------------------------
 
