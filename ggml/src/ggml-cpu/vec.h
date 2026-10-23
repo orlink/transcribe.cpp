@@ -1756,6 +1756,42 @@ inline static void ggml_vec_norm_inv_f32(const int n, float * s, const float * x
 }
 
 inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
+#if defined(__AVX512F__)
+    // Without NaNs the loop below returns the last index of the maximum (equal values, -0 and 0 included, all
+    // move idx). That vectorized: the maximum, then its last index; with a NaN the loop runs as it is.
+    if (n >= 16) {
+        __m512    vmax = _mm512_set1_ps(-INFINITY);
+        __mmask16 nan  = 0;
+        int       i    = 0;
+        for (; i + 16 <= n; i += 16) {
+            const __m512 v = _mm512_loadu_ps(x + i);
+            nan |= _mm512_cmp_ps_mask(v, v, _CMP_UNORD_Q);
+            vmax = _mm512_max_ps(vmax, v);
+        }
+        for (; i < n; ++i) {
+            nan |= (__mmask16) (x[i] != x[i]);
+            vmax = _mm512_max_ps(vmax, _mm512_set1_ps(x[i]));
+        }
+        if (nan == 0) {
+            const __m512 m = _mm512_set1_ps(_mm512_reduce_max_ps(vmax));
+            for (i = n - 1; i >= 0 && i % 16 != 15; --i) {
+                if (x[i] == _mm512_cvtss_f32(m)) {
+                    *s = i;
+                    return;
+                }
+            }
+            for (; i >= 15; i -= 16) {
+                const __mmask16 eq = _mm512_cmp_ps_mask(_mm512_loadu_ps(x + i - 15), m, _CMP_EQ_OQ);
+                if (eq != 0) {
+                    *s = i - 15 + 31 - __builtin_clz((unsigned) eq);
+                    return;
+                }
+            }
+            *s = 0;
+            return;
+        }
+    }
+#endif
     float max = -INFINITY;
     int idx = 0;
     for (int i = 0; i < n; ++i) {

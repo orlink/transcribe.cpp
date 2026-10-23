@@ -10,6 +10,7 @@
 //     and paddings. Skipped where the backend returns no kernel.
 //   - Layer norm fused by the CPU backend (NORM + MUL + ADD) against the unfused nodes, for 1-133 rows.
 //   - The relative-position scores kernel against matmul, shift, scale and f16 cast, for 1-133 frames.
+//   - ggml_argmax (vectorized) against the scalar loop it replaces, with ties, signed zeros, -inf and NaN.
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -496,6 +497,69 @@ void test_rel_pos_scores(ggml_backend_t cpu) {
     }
 }
 
+// ggml_argmax against its scalar definition (the last index of the running maximum), with ties, zeros of both
+// signs, all -inf, and a NaN
+void test_argmax(ggml_backend_t cpu) {
+    std::mt19937                       rng(31);
+    std::uniform_int_distribution<int> small(-3, 3);
+    std::normal_distribution<float>    nd(0.0f, 1.0f);
+    for (const int64_t n : { 16384, 1000, 17, 5 }) {
+        const int64_t rows = 7;
+        Input         x{
+            { n, rows },
+            std::vector<float>(n * rows)
+        };
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t i = 0; i < n; ++i) {
+                float & v = x.data[r * n + i];
+                switch (r) {
+                    case 0:
+                        v = nd(rng);
+                        break;
+                    case 1:
+                        v = static_cast<float>(small(rng));
+                        break;  // many ties
+                    case 2:
+                        v = small(rng) > 0 ? -0.0f : (small(rng) > 0 ? 0.0f : -1.0f);
+                        break;
+                    case 3:
+                        v = -INFINITY;
+                        break;
+                    case 4:
+                        v = i == n / 2 ? NAN : nd(rng);
+                        break;
+                    case 5:
+                        v = i == n - 1 ? 9.0f : nd(rng);
+                        break;
+                    default:
+                        v = i == 0 ? 9.0f : nd(rng);
+                        break;
+                }
+            }
+        }
+        const std::vector<float> got = run_graph(cpu, { x }, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+            return ggml_cast(ctx, ggml_argmax(ctx, t[0]), GGML_TYPE_F32);
+        });
+        CHECK(got.size() == static_cast<size_t>(rows));
+        for (int64_t r = 0; r < rows && got.size() == static_cast<size_t>(rows); ++r) {
+            float max = -INFINITY;
+            int   idx = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                const float v = x.data[r * n + i];
+                max           = max > v ? max : v;
+                if (max == v) {
+                    idx = static_cast<int>(i);
+                }
+            }
+            if (static_cast<int>(got[r]) != idx) {
+                std::fprintf(stderr, "argmax n=%lld row %lld: %d, expected %d\n", (long long) n, (long long) r,
+                             static_cast<int>(got[r]), idx);
+            }
+            CHECK(static_cast<int>(got[r]) == idx);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -513,6 +577,7 @@ int main() {
     test_conv_1d_dw_bn_silu(cpu);
     test_norm_mul_add(cpu);
     test_rel_pos_scores(cpu);
+    test_argmax(cpu);
 
     ggml_backend_free(cpu);
     if (g_failures != 0) {
