@@ -505,6 +505,39 @@ void test_rel_pos_scores(ggml_backend_t cpu) {
     ggml_backend_cpu_set_n_threads(cpu, 4);
 }
 
+// the cast of a permuted f32 tensor to f16 (as for the K and V of conformer flash attention) against the scalar
+// conversion of every value, with overflow to inf and f16 subnormals
+void test_cast_f16(ggml_backend_t cpu) {
+    std::mt19937  rng(37);
+    const int64_t D = 128, H = 3, T = 21;
+    Input         x{
+        { D, H, T },
+        wide_values(rng, D * H * T)
+    };
+    for (size_t k = 0; k < x.data.size(); k += 3) {
+        x.data[k] *= 100.0f;      // up to 1e5: beyond the f16 range
+        x.data[k + 1] *= 0.001f;  // down to 1e-6: f16 subnormals
+    }
+    const std::vector<float> res = run_graph(cpu, { x }, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+        ggml_tensor * c = ggml_cast(ctx, ggml_permute(ctx, t[0], 0, 2, 1, 3), GGML_TYPE_F16);  // [D, T, H]
+        return ggml_cast(ctx, c, GGML_TYPE_F32);
+    });
+    int64_t                  bad = 0;
+    for (int64_t h = 0; h < H; ++h) {
+        for (int64_t i = 0; i < T; ++i) {
+            for (int64_t d = 0; d < D; ++d) {
+                const float v   = x.data[(i * H + h) * D + d];
+                const float ref = ggml_fp16_to_fp32(ggml_fp32_to_fp16(v));
+                bad += same_bits(ref, res[(h * T + i) * D + d]) ? 0 : 1;
+            }
+        }
+    }
+    if (bad != 0) {
+        std::fprintf(stderr, "cast_f16: %lld differ\n", (long long) bad);
+    }
+    CHECK(bad == 0);
+}
+
 // ggml_argmax against its scalar definition (the last index of the running maximum), with ties, zeros of both
 // signs, all -inf, and a NaN
 void test_argmax(ggml_backend_t cpu) {
@@ -585,6 +618,7 @@ int main() {
     test_conv_1d_dw_bn_silu(cpu);
     test_norm_mul_add(cpu);
     test_rel_pos_scores(cpu);
+    test_cast_f16(cpu);
     test_argmax(cpu);
 
     ggml_backend_free(cpu);

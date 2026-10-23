@@ -115,10 +115,16 @@ static void ggml_compute_forward_dup_flt(
                         id += ne00 * ir0;
                         for (int i01 = ir0; i01 < ir1; i01++) {
                             const src_t * src0_ptr = (src_t *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
-                            for (int i00 = 0; i00 < ne00; i00++) {
-                                float tmp = type_conversion_table<src_t>::to_f32(src0_ptr[i00]);
-                                dst_ptr[id] = type_conversion_table<dst_t>::from_f32(tmp);
-                                id++;
+                            if constexpr (std::is_same_v<src_t, float> && std::is_same_v<dst_t, ggml_fp16_t>) {
+                                // the same rounding as the scalar conversion, in vectors
+                                ggml_cpu_fp32_to_fp16(src0_ptr, dst_ptr + id, ne00);
+                                id += ne00;
+                            } else {
+                                for (int i00 = 0; i00 < ne00; i00++) {
+                                    float tmp = type_conversion_table<src_t>::to_f32(src0_ptr[i00]);
+                                    dst_ptr[id] = type_conversion_table<dst_t>::from_f32(tmp);
+                                    id++;
+                                }
                             }
                         }
                         id += ne00 * (ne01 - ir1);
