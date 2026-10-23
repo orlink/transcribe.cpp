@@ -50,13 +50,23 @@ bool is_f32_vector(const ggml_tensor * t, int64_t n) {
 }
 
 // One zero-padded input row split into even and odd columns, so that output column ow of a 3-wide stride-2
-// window reads even[ow], odd[ow], even[ow + 1]. Filled up to n_vec 16-wide vectors (and one more even value).
-void split_row_even_odd(const float * row, int64_t W, int pad, bool valid, int64_t n_vec, float * even, float * odd) {
-    for (int64_t j = 0; j <= 16 * n_vec; ++j) {
-        const int64_t i0 = 2 * j - pad;
-        const int64_t i1 = i0 + 1;
-        even[j]          = valid && i0 >= 0 && i0 < W ? row[i0] : 0.0f;
-        odd[j]           = valid && i1 >= 0 && i1 < W ? row[i1] : 0.0f;
+// window reads even[ow], odd[ow], even[ow + 1]. Filled up to n_vec 16-wide vectors and one more vector. buf is
+// scratch of at least 32 (n_vec + 2) floats, zero outside [pad, pad + W) (it is only written there).
+void split_row_even_odd(const float * row, int64_t W, int pad, bool valid, int64_t n_vec, float * buf, float * even,
+                        float * odd) {
+    if (!valid) {
+        memset(even, 0, 16 * (n_vec + 1) * sizeof(float));
+        memset(odd, 0, 16 * (n_vec + 1) * sizeof(float));
+        return;
+    }
+    memcpy(buf + pad, row, W * sizeof(float));
+    const __m512i ie = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+    const __m512i io = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
+    for (int64_t v = 0; v <= n_vec; ++v) {
+        const __m512 a = _mm512_loadu_ps(buf + 32 * v);
+        const __m512 b = _mm512_loadu_ps(buf + 32 * v + 16);
+        _mm512_storeu_ps(even + 16 * v, _mm512_permutex2var_ps(a, ie, b));
+        _mm512_storeu_ps(odd + 16 * v, _mm512_permutex2var_ps(a, io, b));
     }
 }
 
@@ -107,6 +117,7 @@ void conv_2d_s2_c1_bias_relu(ggml_tensor * dst, int ith, int nth, void * userdat
     constexpr int64_t k_row = (k_max_width + 2 * 2) / 2 + 32;
     float             even[3][k_row];
     float             odd[3][k_row];
+    float             buf[2 * k_row + 64] = {};
     const int64_t     n_vec = (OW + 15) / 16;
 
     const __m512 zero = _mm512_setzero_ps();
@@ -115,7 +126,7 @@ void conv_2d_s2_c1_bias_relu(ggml_tensor * dst, int ith, int nth, void * userdat
         for (int kh = 0; kh < 3; ++kh) {
             const int64_t ih = 2 * oh - pad + kh;
             const bool    in = ih >= 0 && ih < H;
-            split_row_even_odd(in ? xd + ih * W : xd, W, pad, in, n_vec, even[kh], odd[kh]);
+            split_row_even_odd(in ? xd + ih * W : xd, W, pad, in, n_vec, buf, even[kh], odd[kh]);
             for (int64_t j = 0; j <= 16 * n_vec; ++j) {
                 even[kh][j] = round_to_f16(even[kh][j]);
                 odd[kh][j]  = round_to_f16(odd[kh][j]);
@@ -173,12 +184,16 @@ void conv_2d_pw_bias_relu(ggml_tensor * dst, int ith, int nth, void * userdata) 
     // the kernel rounded to f16, [Cout][Cin]
     static thread_local std::vector<float> wk;
     wk.resize(Cin * Cout);
-    for (int64_t i = 0; i < Cin * Cout; ++i) {
-        wk[i] = w->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) w->data)[i]) :
-                                           round_to_f16(((const float *) w->data)[i]);
+    for (int64_t i = 0; i < Cin * Cout; i += 16) {  // Cin is a multiple of 16
+        const __m256i h = w->type == GGML_TYPE_F16 ?
+                              _mm256_loadu_si256((const __m256i *) ((const ggml_fp16_t *) w->data + i)) :
+                              _mm512_cvtps_ph(_mm512_loadu_ps((const float *) w->data + i),
+                                              _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        _mm512_storeu_ps(wk.data() + i, _mm512_cvtph_ps(h));
     }
 
-    // positions in chunks of 16-wide blocks, split over the threads; the chunk's inputs rounded to f16, [Cin][chunk]
+    // positions in chunks of 16-wide blocks, split over the threads; the chunk's inputs rounded to f16, each
+    // block's [Cin][16] values contiguous (so the Cin rows a block reads do not share a few cache sets)
     constexpr int64_t                      k_chunk = 256;
     static thread_local std::vector<float> xs;
     xs.resize(Cin * k_chunk);
@@ -192,42 +207,61 @@ void conv_2d_pw_bias_relu(ggml_tensor * dst, int ith, int nth, void * userdata) 
         const int64_t nv = (np + 15) / 16;
         for (int64_t k = 0; k < Cin; ++k) {
             const float * src = xd + k * P + p0;
-            float *       out = xs.data() + k * k_chunk;
             for (int64_t v = 0; v < nv; ++v) {
                 const __mmask16 m = 16 * v + 16 <= np ? (__mmask16) 0xffff : (__mmask16) ((1u << (np - 16 * v)) - 1);
                 const __m512    a = _mm512_maskz_loadu_ps(m, src + 16 * v);
-                _mm512_storeu_ps(out + 16 * v,
+                _mm512_storeu_ps(xs.data() + (v * Cin + k) * 16,
                                  _mm512_cvtph_ps(_mm512_cvtps_ph(a, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
             }
         }
         for (int64_t v = 0; v < nv; ++v) {
-            const float * xv = xs.data() + 16 * v;
-            for (int64_t oc = 0; oc < Cout; ++oc) {
-                const float * wr = wk.data() + oc * Cin;
-                __m512        a[16];
-                for (int m = 0; m < 16; ++m) {
-                    a[m] = _mm512_setzero_ps();
-                }
-                for (int64_t l = 0; l < Cin; l += 16) {
-                    for (int m = 0; m < 16; ++m) {
-                        a[m] = _mm512_fmadd_ps(_mm512_loadu_ps(xv + (l + m) * k_chunk), _mm512_set1_ps(wr[l + m]), a[m]);
+            const float * xv = xs.data() + v * Cin * 16;
+            // four output channels at a time share the input loads; their 16 accumulators each are computed four
+            // at a time (accumulator m only ever takes channels m, m + 16, ... in order, so any grouping of the
+            // m keeps the sums)
+            for (int64_t oc0 = 0; oc0 < Cout; oc0 += 4) {
+                const int64_t n_oc = std::min<int64_t>(4, Cout - oc0);
+                __m512        a[4][16];
+                for (int mg = 0; mg < 16; mg += 4) {
+                    __m512 acc[4][4];
+                    for (int o = 0; o < 4; ++o) {
+                        for (int m = 0; m < 4; ++m) {
+                            acc[o][m] = _mm512_setzero_ps();
+                        }
+                    }
+                    for (int64_t l = 0; l < Cin; l += 16) {
+                        for (int m = 0; m < 4; ++m) {
+                            const __m512 xk = _mm512_loadu_ps(xv + (l + mg + m) * 16);
+                            for (int o = 0; o < 4; ++o) {
+                                const float * wr = wk.data() + std::min<int64_t>(oc0 + o, Cout - 1) * Cin;
+                                acc[o][m]        = _mm512_fmadd_ps(xk, _mm512_set1_ps(wr[l + mg + m]), acc[o][m]);
+                            }
+                        }
+                    }
+                    for (int o = 0; o < 4; ++o) {
+                        for (int m = 0; m < 4; ++m) {
+                            a[o][mg + m] = acc[o][m];
+                        }
                     }
                 }
-                __m512 t3[8];
-                for (int i = 0; i < 8; ++i) {
-                    t3[i] = _mm512_add_ps(a[8 + i], a[i]);
-                }
-                __m512 t6[4];
-                for (int i = 0; i < 4; ++i) {
-                    t6[i] = _mm512_add_ps(t3[4 + i], t3[i]);
-                }
-                __m512 r = _mm512_add_ps(_mm512_add_ps(t6[0], t6[2]), _mm512_add_ps(t6[1], t6[3]));
-                r        = _mm512_max_ps(_mm512_add_ps(r, _mm512_set1_ps(bd[oc])), _mm512_setzero_ps());
-                float * out = yd + oc * P + p0 + 16 * v;
-                if (16 * v + 16 <= np) {
-                    _mm512_storeu_ps(out, r);
-                } else {
-                    _mm512_mask_storeu_ps(out, (__mmask16) ((1u << (np - 16 * v)) - 1), r);
+                for (int64_t o = 0; o < n_oc; ++o) {
+                    const int64_t oc = oc0 + o;
+                    __m512        t3[8];
+                    for (int i = 0; i < 8; ++i) {
+                        t3[i] = _mm512_add_ps(a[o][8 + i], a[o][i]);
+                    }
+                    __m512 t6[4];
+                    for (int i = 0; i < 4; ++i) {
+                        t6[i] = _mm512_add_ps(t3[4 + i], t3[i]);
+                    }
+                    __m512 r = _mm512_add_ps(_mm512_add_ps(t6[0], t6[2]), _mm512_add_ps(t6[1], t6[3]));
+                    r        = _mm512_max_ps(_mm512_add_ps(r, _mm512_set1_ps(bd[oc])), _mm512_setzero_ps());
+                    float * out = yd + oc * P + p0 + 16 * v;
+                    if (16 * v + 16 <= np) {
+                        _mm512_storeu_ps(out, r);
+                    } else {
+                        _mm512_mask_storeu_ps(out, (__mmask16) ((1u << (np - 16 * v)) - 1), r);
+                    }
                 }
             }
         }
@@ -298,6 +332,7 @@ void conv_2d_dw_s2_bias(ggml_tensor * dst, int ith, int nth, void * userdata) {
     constexpr int64_t k_row = (k_max_width + 2 * 2) / 2 + 32;
     float             even[3][k_row];
     float             odd[3][k_row];
+    float             buf[2 * k_row + 64] = {};
     const int64_t     n_vec = (OW + 15) / 16;
 
     for (int64_t c = c0; c < c1; ++c) {
@@ -311,7 +346,7 @@ void conv_2d_dw_s2_bias(ggml_tensor * dst, int ith, int nth, void * userdata) {
             for (int kh = 0; kh < 3; ++kh) {
                 const int64_t ih = 2 * oh - pad + kh;
                 const bool    in = ih >= 0 && ih < H;
-                split_row_even_odd(in ? plane + ih * W : plane, W, pad, in, n_vec, even[kh], odd[kh]);
+                split_row_even_odd(in ? plane + ih * W : plane, W, pad, in, n_vec, buf, even[kh], odd[kh]);
             }
             float * out = yd + (c * OH + oh) * OW;
             for (int64_t v = 0; v < n_vec; ++v) {

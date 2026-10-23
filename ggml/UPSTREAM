@@ -19,6 +19,7 @@ patches:
   patches/ggml/0016-cpu-norm-row-sums-x16.patch
   patches/ggml/0017-cpu-rel-pos-scores.patch
   patches/ggml/0018-cpu-vector-argmax.patch
+  patches/ggml/0019-cpu-faster-pre-encode-kernels.patch
 
 This directory is generated from the upstream ggml tree at the SHA above, minus
 .github/, with the listed downstream patches applied in order. Do not edit it by
