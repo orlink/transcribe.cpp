@@ -8,6 +8,7 @@
 #include "conformer/conformer.h"
 #include "ggml.h"
 #include "transcribe-debug.h"
+#include "transcribe-env.h"
 #include "transcribe-log.h"
 #include "weights.h"
 
@@ -114,6 +115,8 @@ EncoderBuild build_encoder_graph(ggml_context *        ctx,
     const bool direct_dw           = detect_direct_dw_in_block(backend_name);
     policy.direct_dw_in_block      = direct_dw;
     policy.direct_dw_in_pre_encode = detect_direct_dw_in_pre_encode(backend_name);
+    policy.cpu_fused_ops           = backend_name != nullptr && std::strcmp(backend_name, "CPU") == 0 &&
+                                     !transcribe::env::flag("TRANSCRIBE_NO_CPU_FUSED_OPS");
 
     EncoderBuild eb{};
 

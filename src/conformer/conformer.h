@@ -129,6 +129,10 @@ struct ConvPolicy {
     // Run the pre_encode pointwise convs (conv3, conv6) via conv_2d_f32.
     // Other variants were validated on the F16 im2col and keep it.
     bool pre_encode_f32_pointwise = false;
+
+    // On a CPU primary, run parts of the graph through the CPU backend's direct kernels (ggml-cpu/fused-ops.h),
+    // which give the same results as the ops they replace: the pre_encode convs.
+    bool cpu_fused_ops = false;
 };
 
 // Resolve a conv-dispatch toggle from its env overrides. The DIRECT var forces

@@ -386,7 +386,7 @@ add_test(NAME transcribe_q8_0_grouped_unit
 
 # -----------------------------------------------------------------------------
 # CPU fusions and direct kernels that must reproduce the ops they replace bit
-# for bit (fused sigmoid gate)
+# for bit (fused sigmoid gate, direct kernels)
 # -----------------------------------------------------------------------------
 
 add_executable(transcribe_cpu_fused_ops_unit

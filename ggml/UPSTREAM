@@ -14,6 +14,7 @@ patches:
   patches/ggml/0011-cpu-amx-fuse-bias-add.patch
   patches/ggml/0012-cpu-amx-q8_0-grouped-scales.patch
   patches/ggml/0013-cpu-vector-sigmoid-fused-glu.patch
+  patches/ggml/0014-cpu-direct-pre-encode-convs.patch
 
 This directory is generated from the upstream ggml tree at the SHA above, minus
 .github/, with the listed downstream patches applied in order. Do not edit it by

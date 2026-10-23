@@ -9,12 +9,14 @@
 
 #include "conformer/conformer.h"
 
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe-env.h"
 #include "transcribe-log.h"
 
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1141,6 +1143,40 @@ ggml_tensor * name_prefixed(ggml_tensor * t, const char * prefix, const char * s
 
 }  // namespace
 
+// Getter of a CPU direct conv kernel (ggml-cpu/fused-ops.h) through the CPU backend's proc address; null
+// where the backend has none.
+namespace {
+
+using CpuConvOpGetter = ggml_custom_op_t (*)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int);
+
+CpuConvOpGetter cpu_conv_op_getter(const char * name) {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+    return reg != nullptr ? reinterpret_cast<CpuConvOpGetter>(ggml_backend_reg_get_proc_address(reg, name)) : nullptr;
+}
+
+// A pre_encode conv with its bias (and its ReLU, where the kernel has one) as one CPU direct kernel, or null
+// where the backend has no kernel for these tensors. A 3x3 stride-2 conv with `pad`, or a 1x1 conv with pad 0.
+ggml_tensor * cpu_fused_conv(ggml_context * ctx,
+                             const char *   getter_name,
+                             ggml_tensor *  x,
+                             ggml_tensor *  w,
+                             ggml_tensor *  b,
+                             int            pad) {
+    const CpuConvOpGetter get = cpu_conv_op_getter(getter_name);
+    ggml_custom_op_t      op  = get != nullptr ? get(x, w, b, pad) : nullptr;
+    if (op == nullptr) {
+        return nullptr;
+    }
+    const bool    pointwise = w->ne[0] == 1 && w->ne[1] == 1;
+    const int64_t ne0       = pointwise ? x->ne[0] : (x->ne[0] + 2 * pad - 3) / 2 + 1;
+    const int64_t ne1       = pointwise ? x->ne[1] : (x->ne[1] + 2 * pad - 3) / 2 + 1;
+    ggml_tensor * args[3]   = { x, w, b };
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, ne0, ne1, w->ne[3], 1, args, 3, op, GGML_N_TASKS_MAX,
+                          reinterpret_cast<void *>(static_cast<intptr_t>(pad)));
+}
+
+}  // namespace
+
 // Pre-encode subsampling stack. Op order matches NeMo's
 // DwStridingSubsampling (conformer.py:206-328):
 //
@@ -1230,8 +1266,15 @@ ggml_tensor * build_pre_encode(ggml_context *        ctx,
         return ggml_mul_inplace(ctx, t, m);
     };
 
-    // conv0 (standard 2D conv: 1 in, channels out, k=3 s=2)
-    if (policy.direct_conv0_in_pre_encode) {
+    // conv0 (standard 2D conv: 1 in, channels out, k=3 s=2); on CPU with its bias and ReLU in one kernel
+    ggml_tensor * conv0_fused = nullptr;
+    if (policy.cpu_fused_ops && !policy.direct_conv0_in_pre_encode) {
+        conv0_fused =
+            cpu_fused_conv(ctx, "ggml_backend_cpu_conv_2d_s2_c1_bias_relu_op", x, pe.conv0_w, pe.conv0_b, pe_p_op);
+    }
+    if (conv0_fused != nullptr) {
+        x = conv0_fused;
+    } else if (policy.direct_conv0_in_pre_encode) {
         x = ggml_conv_2d_direct(ctx, pe.conv0_w, x,
                                 /*s0=*/2, /*s1=*/2,
                                 /*p0=*/pe_p_op, /*p1=*/pe_p_op,
@@ -1242,16 +1285,25 @@ ggml_tensor * build_pre_encode(ggml_context *        ctx,
                          /*p0=*/pe_p_op, /*p1=*/pe_p_op,
                          /*d0=*/1, /*d1=*/1);
     }
-    x = add_conv_bias(ctx, x, pe.conv0_b);
-    x = name_prefixed(x, name_prefix, "conv0");
-    x = ggml_relu(ctx, x);
+    if (conv0_fused == nullptr) {
+        x = add_conv_bias(ctx, x, pe.conv0_b);
+        x = name_prefixed(x, name_prefix, "conv0");
+        x = ggml_relu(ctx, x);
+    }
     x = name_prefixed(x, name_prefix, "relu0");
     x = apply_valid_mask(x, valid_masks ? &valid_masks->mask_s1 : nullptr, "pre_encode.valid_mask.s1");
     x = zero_causal_tail(x);
 
     // conv2 (depthwise: channels -> channels, groups=channels, k=3 s=2).
-    // im2col path (conv_2d_dw_f32) when direct_dw_in_pre_encode is false.
-    if (policy.direct_dw_in_pre_encode) {
+    // im2col path (conv_2d_dw_f32) when direct_dw_in_pre_encode is false; on CPU the direct kernel that
+    // reproduces it, with the bias.
+    ggml_tensor * dw_fused = nullptr;
+    if (policy.cpu_fused_ops && !policy.direct_dw_in_pre_encode) {
+        dw_fused = cpu_fused_conv(ctx, "ggml_backend_cpu_conv_2d_dw_s2_bias_op", x, pe.conv2_w, pe.conv2_b, pe_p_op);
+    }
+    if (dw_fused != nullptr) {
+        x = dw_fused;
+    } else if (policy.direct_dw_in_pre_encode) {
         x = ggml_conv_2d_dw_direct(ctx, dw_kernel_for_direct(ctx, pe.conv2_w), x,
                                    /*s0=*/2, /*s1=*/2,
                                    /*p0=*/pe_p_op, /*p1=*/pe_p_op,
@@ -1262,23 +1314,33 @@ ggml_tensor * build_pre_encode(ggml_context *        ctx,
                            /*p0=*/pe_p_op, /*p1=*/pe_p_op,
                            /*d0=*/1, /*d1=*/1);
     }
-    x                       = add_conv_bias(ctx, x, pe.conv2_b);
+    if (dw_fused == nullptr) {
+        x = add_conv_bias(ctx, x, pe.conv2_b);
+    }
     x                       = name_prefixed(x, name_prefix, "conv2");
     const bool after_stride = policy.pre_encode_mask_after_stride;
     if (after_stride) {
         x = apply_valid_mask(x, valid_masks ? &valid_masks->mask_s2 : nullptr, "pre_encode.valid_mask.s2");
     }
 
-    // conv3 (pointwise: channels -> channels, k=1 s=1 p=0)
-    x = policy.pre_encode_f32_pointwise ?
-            conv_2d_f32(ctx, pe.conv3_w, x, /*s0=*/1, /*s1=*/1, /*p0=*/0, /*p1=*/0, /*d0=*/1, /*d1=*/1) :
-            ggml_conv_2d(ctx, pe.conv3_w, x,
-                         /*s0=*/1, /*s1=*/1,
-                         /*p0=*/0, /*p1=*/0,
-                         /*d0=*/1, /*d1=*/1);
-    x = add_conv_bias(ctx, x, pe.conv3_b);
-    x = name_prefixed(x, name_prefix, "conv3");
-    x = ggml_relu(ctx, x);
+    // conv3 (pointwise: channels -> channels, k=1 s=1 p=0); on CPU with its bias and ReLU in one kernel
+    ggml_tensor * pw_fused = nullptr;
+    if (policy.cpu_fused_ops && !policy.pre_encode_f32_pointwise) {
+        pw_fused = cpu_fused_conv(ctx, "ggml_backend_cpu_conv_2d_pw_bias_relu_op", x, pe.conv3_w, pe.conv3_b, 0);
+    }
+    if (pw_fused != nullptr) {
+        x = pw_fused;
+    } else {
+        x = policy.pre_encode_f32_pointwise ?
+                conv_2d_f32(ctx, pe.conv3_w, x, /*s0=*/1, /*s1=*/1, /*p0=*/0, /*p1=*/0, /*d0=*/1, /*d1=*/1) :
+                ggml_conv_2d(ctx, pe.conv3_w, x,
+                             /*s0=*/1, /*s1=*/1,
+                             /*p0=*/0, /*p1=*/0,
+                             /*d0=*/1, /*d1=*/1);
+        x = add_conv_bias(ctx, x, pe.conv3_b);
+        x = name_prefixed(x, name_prefix, "conv3");
+        x = ggml_relu(ctx, x);
+    }
     x = name_prefixed(x, name_prefix, "relu3");
     if (!after_stride) {
         x = apply_valid_mask(x, valid_masks ? &valid_masks->mask_s2 : nullptr, "pre_encode.valid_mask.s2");
@@ -1288,7 +1350,13 @@ ggml_tensor * build_pre_encode(ggml_context *        ctx,
     x = zero_causal_tail(x);
 
     // conv5 (depthwise) -> conv6 (pointwise) -> ReLU
-    if (policy.direct_dw_in_pre_encode) {
+    dw_fused = nullptr;
+    if (policy.cpu_fused_ops && !policy.direct_dw_in_pre_encode) {
+        dw_fused = cpu_fused_conv(ctx, "ggml_backend_cpu_conv_2d_dw_s2_bias_op", x, pe.conv5_w, pe.conv5_b, pe_p_op);
+    }
+    if (dw_fused != nullptr) {
+        x = dw_fused;
+    } else if (policy.direct_dw_in_pre_encode) {
         x = ggml_conv_2d_dw_direct(ctx, dw_kernel_for_direct(ctx, pe.conv5_w), x,
                                    /*s0=*/2, /*s1=*/2,
                                    /*p0=*/pe_p_op, /*p1=*/pe_p_op,
@@ -1299,21 +1367,31 @@ ggml_tensor * build_pre_encode(ggml_context *        ctx,
                            /*p0=*/pe_p_op, /*p1=*/pe_p_op,
                            /*d0=*/1, /*d1=*/1);
     }
-    x = add_conv_bias(ctx, x, pe.conv5_b);
+    if (dw_fused == nullptr) {
+        x = add_conv_bias(ctx, x, pe.conv5_b);
+    }
     x = name_prefixed(x, name_prefix, "conv5");
     if (after_stride) {
         x = apply_valid_mask(x, valid_masks ? &valid_masks->mask_s3 : nullptr, "pre_encode.valid_mask.s3");
     }
 
-    x = policy.pre_encode_f32_pointwise ?
-            conv_2d_f32(ctx, pe.conv6_w, x, /*s0=*/1, /*s1=*/1, /*p0=*/0, /*p1=*/0, /*d0=*/1, /*d1=*/1) :
-            ggml_conv_2d(ctx, pe.conv6_w, x,
-                         /*s0=*/1, /*s1=*/1,
-                         /*p0=*/0, /*p1=*/0,
-                         /*d0=*/1, /*d1=*/1);
-    x = add_conv_bias(ctx, x, pe.conv6_b);
-    x = name_prefixed(x, name_prefix, "conv6");
-    x = ggml_relu(ctx, x);
+    pw_fused = nullptr;
+    if (policy.cpu_fused_ops && !policy.pre_encode_f32_pointwise) {
+        pw_fused = cpu_fused_conv(ctx, "ggml_backend_cpu_conv_2d_pw_bias_relu_op", x, pe.conv6_w, pe.conv6_b, 0);
+    }
+    if (pw_fused != nullptr) {
+        x = pw_fused;
+    } else {
+        x = policy.pre_encode_f32_pointwise ?
+                conv_2d_f32(ctx, pe.conv6_w, x, /*s0=*/1, /*s1=*/1, /*p0=*/0, /*p1=*/0, /*d0=*/1, /*d1=*/1) :
+                ggml_conv_2d(ctx, pe.conv6_w, x,
+                             /*s0=*/1, /*s1=*/1,
+                             /*p0=*/0, /*p1=*/0,
+                             /*d0=*/1, /*d1=*/1);
+        x = add_conv_bias(ctx, x, pe.conv6_b);
+        x = name_prefixed(x, name_prefix, "conv6");
+        x = ggml_relu(ctx, x);
+    }
     x = name_prefixed(x, name_prefix, "relu6");
     if (!after_stride) {
         x = apply_valid_mask(x, valid_masks ? &valid_masks->mask_s3 : nullptr, "pre_encode.valid_mask.s3");

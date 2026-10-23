@@ -5,6 +5,9 @@
 //     g * (1 / (1 + expf(-x))) and 1 / (1 + expf(-x)) bit for bit with glibc's expf (within 1 ulp with other
 //     libms), for ordinary values, 0, -0, +-inf, nan, subnormals and the overflow / underflow ends, on rows whose
 //     length is not a multiple of the vector width.
+//   - The direct conv kernels of ggml-cpu/fused-ops.h (custom ops from the CPU backend's proc address): equal
+//     bit for bit to the generic ops they replace, for inputs spanning six orders of magnitude, several shapes
+//     and paddings. Skipped where the backend returns no kernel.
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -136,6 +139,196 @@ void test_sigmoid_glu(ggml_backend_t cpu) {
     CHECK(bad_glu == 0);
 }
 
+using ConvOpGetter = ggml_custom_op_t (*)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int);
+
+ConvOpGetter conv_op_getter(ggml_backend_t cpu, const char * name) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu));
+    return reinterpret_cast<ConvOpGetter>(ggml_backend_reg_get_proc_address(reg, name));
+}
+
+// values of both signs spanning six orders of magnitude, so that a different summation order shows
+std::vector<float> wide_values(std::mt19937 & rng, size_t n) {
+    std::normal_distribution<float>       nd(0.0f, 1.0f);
+    std::uniform_real_distribution<float> ue(-3.0f, 3.0f);
+    std::vector<float>                    v(n);
+    for (float & x : v) {
+        x = nd(rng) * std::pow(10.0f, ue(rng));
+    }
+    return v;
+}
+
+int64_t count_differ(const std::vector<float> & a, const std::vector<float> & b) {
+    if (a.empty() || a.size() != b.size()) {
+        return -1;
+    }
+    int64_t n = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        n += !same_bits(a[i], b[i]);
+    }
+    return n;
+}
+
+int64_t conv_out(int64_t n, int pad) {
+    return (n + 2 * pad - 3) / 2 + 1;
+}
+
+// conv0 of a conformer pre-encode: ggml_conv_2d (1 input channel, 3x3, stride 2) + bias + ReLU
+void test_conv_2d_s2_c1(ggml_backend_t cpu) {
+    const ConvOpGetter get = conv_op_getter(cpu, "ggml_backend_cpu_conv_2d_s2_c1_bias_relu_op");
+    if (get == nullptr) {
+        std::printf("conv_2d_s2_c1: no kernel, skipped\n");
+        return;
+    }
+    std::mt19937  rng(11);
+    const int64_t C = 256;
+    for (const int64_t W : { 128, 80 }) {
+        for (const int64_t H : { 36, 101, 530 }) {
+            for (const int pad : { 1, 2 }) {
+                const Input x{
+                    { W, H, 1, 1 },
+                    wide_values(rng, W * H)
+                };
+                const Input w{
+                    { 3, 3, 1, C },
+                    wide_values(rng, 9 * C)
+                };
+                const Input              b{ { C }, wide_values(rng, C) };
+                const std::vector<float> ref =
+                    run_graph(cpu, { x, w, b }, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+                        ggml_tensor * y = ggml_conv_2d(ctx, t[1], t[0], 2, 2, pad, pad, 1, 1);
+                        y               = ggml_add(ctx, y, ggml_reshape_4d(ctx, t[2], 1, 1, C, 1));
+                        return ggml_relu(ctx, y);
+                    });
+                ggml_custom_op_t         op = nullptr;
+                const std::vector<float> got =
+                    run_graph(cpu, { x, w, b }, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+                        op = get(t[0], t[1], t[2], pad);
+                        if (op == nullptr) {
+                            return ggml_relu(ctx, ggml_conv_2d(ctx, t[1], t[0], 2, 2, pad, pad, 1, 1));
+                        }
+                        ggml_tensor * args[3] = { t[0], t[1], t[2] };
+                        return ggml_custom_4d(ctx, GGML_TYPE_F32, conv_out(W, pad), conv_out(H, pad), C, 1, args, 3, op,
+                                              GGML_N_TASKS_MAX, reinterpret_cast<void *>(static_cast<intptr_t>(pad)));
+                    });
+                if (op == nullptr) {
+                    continue;  // a shape the kernel does not reproduce
+                }
+                const int64_t bad = count_differ(ref, got);
+                if (bad != 0) {
+                    std::fprintf(stderr, "conv_2d_s2_c1 W=%lld H=%lld pad=%d: %lld differ\n", (long long) W,
+                                 (long long) H, pad, (long long) bad);
+                }
+                CHECK(bad == 0);
+            }
+        }
+    }
+}
+
+// conv2 / conv5 of a conformer pre-encode: f32 im2col with a [9 x 1] matmul per channel (as conformer's
+// conv_2d_dw_f32 builds it) + bias
+void test_conv_2d_dw_s2(ggml_backend_t cpu) {
+    const ConvOpGetter get = conv_op_getter(cpu, "ggml_backend_cpu_conv_2d_dw_s2_bias_op");
+    if (get == nullptr) {
+        std::printf("conv_2d_dw_s2: no kernel, skipped\n");
+        return;
+    }
+    std::mt19937  rng(13);
+    const int64_t C = 64;
+    for (const int64_t W : { 64, 32, 20 }) {
+        for (const int64_t H : { 17, 124, 265 }) {
+            for (const int pad : { 1, 2 }) {
+                const Input x{
+                    { W, H, C, 1 },
+                    wide_values(rng, W * H * C)
+                };
+                const Input w{
+                    { 3, 3, 1, C },
+                    wide_values(rng, 9 * C)
+                };
+                const Input              b{ { C }, wide_values(rng, C) };
+                const std::vector<float> ref =
+                    run_graph(cpu, { x, w, b }, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+                        ggml_tensor * k  = ggml_reshape_4d(ctx, t[1], 3, 3, 1, C);
+                        ggml_tensor * d  = ggml_reshape_4d(ctx, t[0], W, H, 1, C);
+                        ggml_tensor * ic = ggml_im2col(ctx, k, d, 2, 2, pad, pad, 1, 1, true, GGML_TYPE_F32);
+                        ggml_tensor * nb = ggml_reshape_4d(ctx, ic, ic->ne[0], ic->ne[2] * ic->ne[1], C, 1);
+                        ggml_tensor * y  = ggml_mul_mat(ctx, ggml_reshape_4d(ctx, k, 9, 1, C, 1), nb);
+                        y                = ggml_reshape_4d(ctx, y, ic->ne[1], ic->ne[2], C, 1);
+                        return ggml_add(ctx, y, ggml_reshape_4d(ctx, t[2], 1, 1, C, 1));
+                    });
+                ggml_custom_op_t         op = nullptr;
+                const std::vector<float> got =
+                    run_graph(cpu, { x, w, b }, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+                        op = get(t[0], t[1], t[2], pad);
+                        if (op == nullptr) {
+                            return ggml_cont(ctx, t[0]);
+                        }
+                        ggml_tensor * args[3] = { t[0], t[1], t[2] };
+                        return ggml_custom_4d(ctx, GGML_TYPE_F32, conv_out(W, pad), conv_out(H, pad), C, 1, args, 3, op,
+                                              GGML_N_TASKS_MAX, reinterpret_cast<void *>(static_cast<intptr_t>(pad)));
+                    });
+                CHECK(op != nullptr);
+                const int64_t bad = count_differ(ref, got);
+                if (bad != 0) {
+                    std::fprintf(stderr, "conv_2d_dw_s2 W=%lld H=%lld pad=%d: %lld differ\n", (long long) W,
+                                 (long long) H, pad, (long long) bad);
+                }
+                CHECK(bad == 0);
+            }
+        }
+    }
+}
+
+// conv3 / conv6 of a conformer pre-encode: ggml_conv_2d with a 1x1 kernel + bias + ReLU
+void test_conv_2d_pw(ggml_backend_t cpu) {
+    const ConvOpGetter get = conv_op_getter(cpu, "ggml_backend_cpu_conv_2d_pw_bias_relu_op");
+    if (get == nullptr) {
+        std::printf("conv_2d_pw: no kernel, skipped\n");
+        return;
+    }
+    std::mt19937  rng(17);
+    const int64_t C = 256;
+    for (const int64_t W : { 32, 16, 20 }) {
+        for (const int64_t H : { 9, 62, 133, 300 }) {
+            const Input x{
+                { W, H, C, 1 },
+                wide_values(rng, W * H * C)
+            };
+            const Input w{
+                { 1, 1, C, C },
+                wide_values(rng, C * C)
+            };
+            const Input              b{ { C }, wide_values(rng, C) };
+            const std::vector<float> ref =
+                run_graph(cpu, { x, w, b }, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+                    ggml_tensor * y = ggml_conv_2d(ctx, t[1], t[0], 1, 1, 0, 0, 1, 1);
+                    y               = ggml_add(ctx, y, ggml_reshape_4d(ctx, t[2], 1, 1, C, 1));
+                    return ggml_relu(ctx, y);
+                });
+            ggml_custom_op_t         op = nullptr;
+            const std::vector<float> got =
+                run_graph(cpu, { x, w, b }, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+                    op = get(t[0], t[1], t[2], 0);
+                    if (op == nullptr) {
+                        return ggml_cont(ctx, t[0]);
+                    }
+                    ggml_tensor * args[3] = { t[0], t[1], t[2] };
+                    return ggml_custom_4d(ctx, GGML_TYPE_F32, W, H, C, 1, args, 3, op, GGML_N_TASKS_MAX, nullptr);
+                });
+            CHECK(op != nullptr || (W * H) % 4 != 0);
+            if (op == nullptr) {
+                continue;
+            }
+            const int64_t bad = count_differ(ref, got);
+            if (bad != 0) {
+                std::fprintf(stderr, "conv_2d_pw W=%lld H=%lld: %lld differ\n", (long long) W, (long long) H,
+                             (long long) bad);
+            }
+            CHECK(bad == 0);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -147,6 +340,9 @@ int main() {
     ggml_backend_cpu_set_n_threads(cpu, 4);
 
     test_sigmoid_glu(cpu);
+    test_conv_2d_s2_c1(cpu);
+    test_conv_2d_dw_s2(cpu);
+    test_conv_2d_pw(cpu);
 
     ggml_backend_free(cpu);
     if (g_failures != 0) {

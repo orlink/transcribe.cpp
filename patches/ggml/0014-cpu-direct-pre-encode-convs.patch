@@ -1,0 +1,506 @@
+diff --git a/src/ggml-cpu/CMakeLists.txt b/src/ggml-cpu/CMakeLists.txt
+index b1d514a..2aedbb2 100644
+--- a/src/ggml-cpu/CMakeLists.txt
++++ b/src/ggml-cpu/CMakeLists.txt
+@@ -58,6 +58,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+         ggml-cpu/vec.cpp
+         ggml-cpu/ops.h
+         ggml-cpu/ops.cpp
++        ggml-cpu/fused-ops.h
++        ggml-cpu/fused-ops.cpp
+         )
+ 
+     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
+diff --git a/src/ggml-cpu/fused-ops.cpp b/src/ggml-cpu/fused-ops.cpp
+new file mode 100644
+index 0000000..dae4bd4
+--- /dev/null
++++ b/src/ggml-cpu/fused-ops.cpp
+@@ -0,0 +1,419 @@
++// Direct kernels that reproduce the generic CPU path bit for bit (see fused-ops.h).
++
++#include "fused-ops.h"
++
++#include "ggml-cpu-impl.h"
++#include "simd-mappings.h"
++#include "vec.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <random>
++#include <vector>
++
++#if defined(__AVX512F__)
++#include <immintrin.h>
++#endif
++
++// The kernels follow instruction sequences of GCC's AVX-512 build. Other builds keep the generic path.
++#if defined(__AVX512F__) && defined(__GNUC__) && !defined(__clang__)
++#define GGML_CONV_FUSED_AVX512 1
++// conv kernels whose generic matmul is tinyBLAS (llamafile/sgemm.cpp), with the summation tree of GCC's
++// _mm512_reduce_add_ps
++#if defined(GGML_USE_LLAMAFILE)
++#define GGML_CONV_FUSED_TINYBLAS 1
++#endif
++#endif
++
++namespace {
++
++#if defined(GGML_CONV_FUSED_AVX512)
++
++// Plain products that GCC must not fuse with a following add (it fuses _mm512_mul_ps + _mm512_add_ps under
++// -ffp-contract=fast, but not the _round_ forms).
++inline __m512 mul_unfused(__m512 a, __m512 b) {
++    return _mm512_mul_round_ps(a, b, _MM_FROUND_CUR_DIRECTION);
++}
++
++constexpr int64_t k_max_width    = 2048;
++constexpr int64_t k_max_channels = 1024;
++
++inline int64_t conv_out_size_k3s2(int64_t n, int pad) {
++    return (n + 2 * pad - 3) / 2 + 1;
++}
++
++bool is_f32_vector(const ggml_tensor * t, int64_t n) {
++    return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == n;
++}
++
++// One zero-padded input row split into even and odd columns, so that output column ow of a 3-wide stride-2
++// window reads even[ow], odd[ow], even[ow + 1]. Filled up to n_vec 16-wide vectors (and one more even value).
++void split_row_even_odd(const float * row, int64_t W, int pad, bool valid, int64_t n_vec, float * even, float * odd) {
++    for (int64_t j = 0; j <= 16 * n_vec; ++j) {
++        const int64_t i0 = 2 * j - pad;
++        const int64_t i1 = i0 + 1;
++        even[j]          = valid && i0 >= 0 && i0 < W ? row[i0] : 0.0f;
++        odd[j]           = valid && i1 >= 0 && i1 < W ? row[i1] : 0.0f;
++    }
++}
++
++#endif  // GGML_CONV_FUSED_AVX512
++
++#if defined(GGML_CONV_FUSED_TINYBLAS)
++
++inline float round_to_f16(float v) {
++    return GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(v));
++}
++
++// The generic path: im2col to f16 ([OW * OH, 9] rows), the kernel converted to f16, and tinyBLAS's AVX-512
++// gemm with k = 9 < 16: one masked fmadd of the nine f16 products into zeros (exact, f16 products fit in f32),
++// then _mm512_reduce_add_ps, whose tree over lanes 0-8 (lanes 9-15 zero) is
++//   ((p4 + (p8 + p0)) + (p6 + p2)) + ((p5 + p1) + (p7 + p3)),
++// then a separate bias add and ReLU. Here the lanes are 16 neighbouring outputs of one row and channel.
++void conv_2d_s2_c1_bias_relu(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    const ggml_tensor * x   = dst->src[0];
++    const ggml_tensor * w   = dst->src[1];
++    const ggml_tensor * b   = dst->src[2];
++    const int           pad = (int) (intptr_t) userdata;
++
++    const int64_t W  = x->ne[0];
++    const int64_t H  = x->ne[1];
++    const int64_t OW = dst->ne[0];
++    const int64_t OH = dst->ne[1];
++    const int64_t C  = dst->ne[2];
++
++    const float * xd = (const float *) x->data;
++    const float * bd = (const float *) b->data;
++    float *       yd = (float *) dst->data;
++
++    const int64_t oh0 = OH * ith / nth;
++    const int64_t oh1 = OH * (ith + 1) / nth;
++    if (oh0 >= oh1) {
++        return;
++    }
++
++    // the kernel rounded to f16, as the matmul converts it
++    float wk[9 * k_max_channels];
++    for (int64_t i = 0; i < 9 * C; ++i) {
++        wk[i] = w->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) w->data)[i]) :
++                                           round_to_f16(((const float *) w->data)[i]);
++    }
++
++    // per kernel row, the f16-rounded zero-padded input row split into even and odd columns: output column ow
++    // reads padded columns 2 ow, 2 ow + 1, 2 ow + 2 = even[ow], odd[ow], even[ow + 1]
++    constexpr int64_t k_row = (k_max_width + 2 * 2) / 2 + 32;
++    float             even[3][k_row];
++    float             odd[3][k_row];
++    const int64_t     n_vec = (OW + 15) / 16;
++
++    const __m512 zero = _mm512_setzero_ps();
++
++    for (int64_t oh = oh0; oh < oh1; ++oh) {
++        for (int kh = 0; kh < 3; ++kh) {
++            const int64_t ih = 2 * oh - pad + kh;
++            const bool    in = ih >= 0 && ih < H;
++            split_row_even_odd(in ? xd + ih * W : xd, W, pad, in, n_vec, even[kh], odd[kh]);
++            for (int64_t j = 0; j <= 16 * n_vec; ++j) {
++                even[kh][j] = round_to_f16(even[kh][j]);
++                odd[kh][j]  = round_to_f16(odd[kh][j]);
++            }
++        }
++        for (int64_t c = 0; c < C; ++c) {
++            __m512 wv[9];
++            for (int k = 0; k < 9; ++k) {
++                wv[k] = _mm512_set1_ps(wk[c * 9 + k]);
++            }
++            const __m512 bc  = _mm512_set1_ps(bd[c]);
++            float *      out = yd + (c * OH + oh) * OW;
++            for (int64_t v = 0; v < n_vec; ++v) {
++                const int64_t ow0 = 16 * v;
++                __m512        p[9];
++                for (int kh = 0; kh < 3; ++kh) {
++                    p[3 * kh + 0] = _mm512_fmadd_ps(_mm512_loadu_ps(even[kh] + ow0), wv[3 * kh + 0], zero);
++                    p[3 * kh + 1] = _mm512_fmadd_ps(_mm512_loadu_ps(odd[kh] + ow0), wv[3 * kh + 1], zero);
++                    p[3 * kh + 2] = _mm512_fmadd_ps(_mm512_loadu_ps(even[kh] + ow0 + 1), wv[3 * kh + 2], zero);
++                }
++                __m512 r = _mm512_add_ps(
++                    _mm512_add_ps(_mm512_add_ps(p[4], _mm512_add_ps(p[8], p[0])), _mm512_add_ps(p[6], p[2])),
++                    _mm512_add_ps(_mm512_add_ps(p[5], p[1]), _mm512_add_ps(p[7], p[3])));
++                r = _mm512_max_ps(_mm512_add_ps(r, bc), zero);  // max(nan, 0) and max(-0, 0) give 0, as ReLU
++                if (ow0 + 16 <= OW) {
++                    _mm512_storeu_ps(out + ow0, r);
++                } else {
++                    _mm512_mask_storeu_ps(out + ow0, (__mmask16) ((1u << (OW - ow0)) - 1), r);
++                }
++            }
++        }
++    }
++}
++
++// The generic path of a 1x1 conv: im2col to f16 (each position's Cin values), the kernel converted to f16, and
++// tinyBLAS's AVX-512 gemm with k = Cin a multiple of 16: per output, one vector accumulator whose lane m takes
++// the f16 products of channels m, m + 16, m + 32, ... by FMA in that order, then _mm512_reduce_add_ps of the 16
++// lanes, then a separate bias add and ReLU. Here the lanes are 16 neighbouring positions instead, with 16
++// accumulators (one per lane m of the original) reduced by the same tree:
++//   T3[i] = a[8 + i] + a[i], T6[i] = T3[4 + i] + T3[i], r = (T6[0] + T6[2]) + (T6[1] + T6[3]).
++void conv_2d_pw_bias_relu(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    (void) userdata;
++    const ggml_tensor * x = dst->src[0];
++    const ggml_tensor * w = dst->src[1];
++    const ggml_tensor * b = dst->src[2];
++
++    const int64_t P    = x->ne[0] * x->ne[1];
++    const int64_t Cin  = x->ne[2];
++    const int64_t Cout = dst->ne[2];
++
++    const float * xd = (const float *) x->data;
++    const float * bd = (const float *) b->data;
++    float *       yd = (float *) dst->data;
++
++    // the kernel rounded to f16, [Cout][Cin]
++    static thread_local std::vector<float> wk;
++    wk.resize(Cin * Cout);
++    for (int64_t i = 0; i < Cin * Cout; ++i) {
++        wk[i] = w->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) w->data)[i]) :
++                                           round_to_f16(((const float *) w->data)[i]);
++    }
++
++    // positions in chunks of 16-wide blocks, split over the threads; the chunk's inputs rounded to f16, [Cin][chunk]
++    constexpr int64_t                      k_chunk = 256;
++    static thread_local std::vector<float> xs;
++    xs.resize(Cin * k_chunk);
++    const int64_t n_blk = (P + 15) / 16;
++    const int64_t blk0  = n_blk * ith / nth;
++    const int64_t blk1  = n_blk * (ith + 1) / nth;
++
++    for (int64_t cb = blk0; cb < blk1; cb += k_chunk / 16) {
++        const int64_t p0 = 16 * cb;
++        const int64_t np = std::min<int64_t>(16 * std::min<int64_t>(blk1 - cb, k_chunk / 16), P - p0);
++        const int64_t nv = (np + 15) / 16;
++        for (int64_t k = 0; k < Cin; ++k) {
++            const float * src = xd + k * P + p0;
++            float *       out = xs.data() + k * k_chunk;
++            for (int64_t v = 0; v < nv; ++v) {
++                const __mmask16 m = 16 * v + 16 <= np ? (__mmask16) 0xffff : (__mmask16) ((1u << (np - 16 * v)) - 1);
++                const __m512    a = _mm512_maskz_loadu_ps(m, src + 16 * v);
++                _mm512_storeu_ps(out + 16 * v,
++                                 _mm512_cvtph_ps(_mm512_cvtps_ph(a, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
++            }
++        }
++        for (int64_t v = 0; v < nv; ++v) {
++            const float * xv = xs.data() + 16 * v;
++            for (int64_t oc = 0; oc < Cout; ++oc) {
++                const float * wr = wk.data() + oc * Cin;
++                __m512        a[16];
++                for (int m = 0; m < 16; ++m) {
++                    a[m] = _mm512_setzero_ps();
++                }
++                for (int64_t l = 0; l < Cin; l += 16) {
++                    for (int m = 0; m < 16; ++m) {
++                        a[m] = _mm512_fmadd_ps(_mm512_loadu_ps(xv + (l + m) * k_chunk), _mm512_set1_ps(wr[l + m]), a[m]);
++                    }
++                }
++                __m512 t3[8];
++                for (int i = 0; i < 8; ++i) {
++                    t3[i] = _mm512_add_ps(a[8 + i], a[i]);
++                }
++                __m512 t6[4];
++                for (int i = 0; i < 4; ++i) {
++                    t6[i] = _mm512_add_ps(t3[4 + i], t3[i]);
++                }
++                __m512 r = _mm512_add_ps(_mm512_add_ps(t6[0], t6[2]), _mm512_add_ps(t6[1], t6[3]));
++                r        = _mm512_max_ps(_mm512_add_ps(r, _mm512_set1_ps(bd[oc])), _mm512_setzero_ps());
++                float * out = yd + oc * P + p0 + 16 * v;
++                if (16 * v + 16 <= np) {
++                    _mm512_storeu_ps(out, r);
++                } else {
++                    _mm512_mask_storeu_ps(out, (__mmask16) ((1u << (np - 16 * v)) - 1), r);
++                }
++            }
++        }
++    }
++}
++
++#endif  // GGML_CONV_FUSED_TINYBLAS
++
++#if defined(GGML_CONV_FUSED_AVX512)
++
++// The generic path: im2col (f32) and per channel a [9 x 1] matmul, each output a ggml_vec_dot_f32 of length 9,
++// which GCC's AVX-512 build computes as one vector of the first eight products, added one by one to zero, and
++// the ninth product added with an FMA; then a separate bias add. dot9 is that sum for one output.
++inline float dot9(const float * w, const float * x) {
++    __m128 s = _mm_setzero_ps();
++    for (int k = 0; k < 8; ++k) {
++        s = _mm_add_ss(s, _mm_mul_round_ss(_mm_set_ss(w[k]), _mm_set_ss(x[k]), _MM_FROUND_CUR_DIRECTION));
++    }
++    return _mm_cvtss_f32(_mm_fmadd_ss(_mm_set_ss(w[8]), _mm_set_ss(x[8]), s));
++}
++
++// Whether ggml_vec_dot_f32 of length 9 sums as dot9, on random values spanning many magnitudes
++bool vec_dot9_matches() {
++    static const bool ok = [] {
++        std::mt19937                          rng(5);
++        std::normal_distribution<float>       nd(0.0f, 1.0f);
++        std::uniform_real_distribution<float> ue(-4.0f, 4.0f);
++        float                                 w[9];
++        float                                 x[9];
++        for (int t = 0; t < 4096; ++t) {
++            for (int k = 0; k < 9; ++k) {
++                w[k] = nd(rng) * powf(10.0f, ue(rng));
++                x[k] = nd(rng) * powf(10.0f, ue(rng));
++            }
++            float ref = 0.0f;
++            ggml_vec_dot_f32(9, &ref, 0, w, 0, x, 0, 1);
++            const float got = dot9(w, x);
++            if (memcmp(&ref, &got, sizeof(float)) != 0) {
++                return false;
++            }
++        }
++        return true;
++    }();
++    return ok;
++}
++
++// The same sums with 16 neighbouring outputs of a row in the lanes, plus the bias.
++void conv_2d_dw_s2_bias(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    const ggml_tensor * x   = dst->src[0];
++    const ggml_tensor * w   = dst->src[1];
++    const ggml_tensor * b   = dst->src[2];
++    const int           pad = (int) (intptr_t) userdata;
++
++    const int64_t W  = x->ne[0];
++    const int64_t H  = x->ne[1];
++    const int64_t OW = dst->ne[0];
++    const int64_t OH = dst->ne[1];
++    const int64_t C  = dst->ne[2];
++
++    const float * xd = (const float *) x->data;
++    const float * wd = (const float *) w->data;
++    const float * bd = (const float *) b->data;
++    float *       yd = (float *) dst->data;
++
++    const int64_t c0 = C * ith / nth;
++    const int64_t c1 = C * (ith + 1) / nth;
++
++    constexpr int64_t k_row = (k_max_width + 2 * 2) / 2 + 32;
++    float             even[3][k_row];
++    float             odd[3][k_row];
++    const int64_t     n_vec = (OW + 15) / 16;
++
++    for (int64_t c = c0; c < c1; ++c) {
++        __m512 wv[9];
++        for (int k = 0; k < 9; ++k) {
++            wv[k] = _mm512_set1_ps(wd[c * 9 + k]);
++        }
++        const __m512  bc    = _mm512_set1_ps(bd[c]);
++        const float * plane = xd + c * H * W;
++        for (int64_t oh = 0; oh < OH; ++oh) {
++            for (int kh = 0; kh < 3; ++kh) {
++                const int64_t ih = 2 * oh - pad + kh;
++                const bool    in = ih >= 0 && ih < H;
++                split_row_even_odd(in ? plane + ih * W : plane, W, pad, in, n_vec, even[kh], odd[kh]);
++            }
++            float * out = yd + (c * OH + oh) * OW;
++            for (int64_t v = 0; v < n_vec; ++v) {
++                const int64_t ow0 = 16 * v;
++                __m512        s   = _mm512_setzero_ps();
++                for (int kh = 0; kh < 3; ++kh) {
++                    s = _mm512_add_ps(s, mul_unfused(wv[3 * kh + 0], _mm512_loadu_ps(even[kh] + ow0)));
++                    s = _mm512_add_ps(s, mul_unfused(wv[3 * kh + 1], _mm512_loadu_ps(odd[kh] + ow0)));
++                    if (kh < 2) {
++                        s = _mm512_add_ps(s, mul_unfused(wv[3 * kh + 2], _mm512_loadu_ps(even[kh] + ow0 + 1)));
++                    }
++                }
++                s = _mm512_fmadd_ps(wv[8], _mm512_loadu_ps(even[2] + ow0 + 1), s);
++                s = _mm512_add_ps(s, bc);
++                if (ow0 + 16 <= OW) {
++                    _mm512_storeu_ps(out + ow0, s);
++                } else {
++                    _mm512_mask_storeu_ps(out + ow0, (__mmask16) ((1u << (OW - ow0)) - 1), s);
++                }
++            }
++        }
++    }
++}
++
++#endif  // GGML_CONV_FUSED_AVX512
++
++}  // namespace
++
++extern "C" ggml_custom_op_t ggml_cpu_conv_2d_s2_c1_bias_relu_op(const ggml_tensor * x, const ggml_tensor * w,
++                                                                const ggml_tensor * b, int pad) {
++#if defined(GGML_CONV_FUSED_TINYBLAS)
++    if (x == nullptr || w == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 ||
++        x->ne[3] != 1 || x->ne[0] > k_max_width) {
++        return nullptr;
++    }
++    if ((w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16) || !ggml_is_contiguous(w) || w->ne[0] != 3 ||
++        w->ne[1] != 3 || w->ne[2] != 1 || w->ne[3] < 2 || w->ne[3] > k_max_channels || !is_f32_vector(b, w->ne[3])) {
++        return nullptr;
++    }
++    const int64_t OW = conv_out_size_k3s2(x->ne[0], pad);
++    const int64_t OH = conv_out_size_k3s2(x->ne[1], pad);
++    // the generic matmul takes the tinyBLAS kernel only when its rows divide by 4
++    if (pad < 0 || pad > 2 || OW < 1 || OH < 1 || (OW * OH) % 4 != 0) {
++        return nullptr;
++    }
++    return conv_2d_s2_c1_bias_relu;
++#else
++    (void) x;
++    (void) w;
++    (void) b;
++    (void) pad;
++    return nullptr;
++#endif
++}
++
++extern "C" ggml_custom_op_t ggml_cpu_conv_2d_pw_bias_relu_op(const ggml_tensor * x, const ggml_tensor * w,
++                                                             const ggml_tensor * b, int pad) {
++#if defined(GGML_CONV_FUSED_TINYBLAS)
++    if (x == nullptr || w == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[3] != 1 ||
++        pad != 0) {
++        return nullptr;
++    }
++    const int64_t Cin = x->ne[2];
++    if ((w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16) || !ggml_is_contiguous(w) || w->ne[0] != 1 ||
++        w->ne[1] != 1 || w->ne[2] != Cin || w->ne[3] < 2 || !is_f32_vector(b, w->ne[3])) {
++        return nullptr;
++    }
++    // the generic matmul takes the tinyBLAS kernel, without a partial vector, only for rows that divide by 4 and
++    // a channel count that divides by 16
++    if (Cin % 16 != 0 || Cin > k_max_channels || (x->ne[0] * x->ne[1]) % 4 != 0) {
++        return nullptr;
++    }
++    return conv_2d_pw_bias_relu;
++#else
++    (void) x;
++    (void) w;
++    (void) b;
++    (void) pad;
++    return nullptr;
++#endif
++}
++
++extern "C" ggml_custom_op_t ggml_cpu_conv_2d_dw_s2_bias_op(const ggml_tensor * x, const ggml_tensor * w,
++                                                           const ggml_tensor * b, int pad) {
++#if defined(GGML_CONV_FUSED_AVX512)
++    if (x == nullptr || w == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[3] != 1 ||
++        x->ne[0] > k_max_width) {
++        return nullptr;
++    }
++    if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->ne[0] != 3 || w->ne[1] != 3 || w->ne[2] != 1 ||
++        w->ne[3] != x->ne[2] || !is_f32_vector(b, w->ne[3])) {
++        return nullptr;
++    }
++    if (pad < 0 || pad > 2 || conv_out_size_k3s2(x->ne[0], pad) < 1 || conv_out_size_k3s2(x->ne[1], pad) < 1 ||
++        !vec_dot9_matches()) {
++        return nullptr;
++    }
++    return conv_2d_dw_s2_bias;
++#else
++    (void) x;
++    (void) w;
++    (void) b;
++    (void) pad;
++    return nullptr;
++#endif
++}
+diff --git a/src/ggml-cpu/fused-ops.h b/src/ggml-cpu/fused-ops.h
+new file mode 100644
+index 0000000..aa7c399
+--- /dev/null
++++ b/src/ggml-cpu/fused-ops.h
+@@ -0,0 +1,34 @@
++#pragma once
++
++#include "ggml.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Direct kernels, run as custom ops, for chains of ops that the CPU backend otherwise computes as several nodes
++// (im2col and a matmul with separate bias and activation nodes, copies for transposes). Each kernel computes every
++// output with the operations of that generic path, in the same order, so the results are bit-identical with it.
++// A getter returns NULL where the generic path for the given tensors is not the one a kernel reproduces (other
++// compilers, instruction sets or shapes); the caller then builds the generic ops. Unless noted otherwise, the
++// custom op's userdata is the padding.
++
++// x [W, H, 1, 1] f32 convolved with w [3, 3, 1, C] (f32 or f16), stride 2, the same padding on both axes, plus
++// b [C] f32, then ReLU: [OW, OH, C, 1]. Reproduces ggml_conv_2d (f16 im2col and matmul) + ggml_add + ggml_relu.
++ggml_custom_op_t ggml_cpu_conv_2d_s2_c1_bias_relu_op(const struct ggml_tensor * x, const struct ggml_tensor * w,
++                                                     const struct ggml_tensor * b, int pad);
++
++// Depthwise: x [W, H, C, 1] f32, w [3, 3, 1, C] f32, stride 2, the same padding on both axes, plus b [C] f32:
++// [OW, OH, C, 1]. Reproduces an f32 im2col with a [9 x 1] matmul per channel (conformer conv_2d_dw_f32) +
++// ggml_add.
++ggml_custom_op_t ggml_cpu_conv_2d_dw_s2_bias_op(const struct ggml_tensor * x, const struct ggml_tensor * w,
++                                                const struct ggml_tensor * b, int pad);
++
++// Pointwise: x [W, H, Cin, 1] f32 with w [1, 1, Cin, Cout] (f32 or f16), plus b [Cout] f32, then ReLU:
++// [W, H, Cout, 1]; pad must be 0. Reproduces ggml_conv_2d (f16 im2col and matmul) + ggml_add + ggml_relu.
++ggml_custom_op_t ggml_cpu_conv_2d_pw_bias_relu_op(const struct ggml_tensor * x, const struct ggml_tensor * w,
++                                                  const struct ggml_tensor * b, int pad);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/ggml-cpu/ggml-cpu.cpp b/src/ggml-cpu/ggml-cpu.cpp
+index a65742d..76fb00d 100644
+--- a/src/ggml-cpu/ggml-cpu.cpp
++++ b/src/ggml-cpu/ggml-cpu.cpp
+@@ -5,6 +5,7 @@
+ #include "traits.h"
+ #include "ggml-impl.h"
+ #include "amx/amx.h"
++#include "fused-ops.h"
+ 
+ #include <cctype>
+ #include <string>
+@@ -710,6 +711,15 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
+     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
+         return (void *)ggml_backend_cpu_set_use_ref;
+     }
++    if (strcmp(name, "ggml_backend_cpu_conv_2d_s2_c1_bias_relu_op") == 0) {
++        return (void *)ggml_cpu_conv_2d_s2_c1_bias_relu_op;
++    }
++    if (strcmp(name, "ggml_backend_cpu_conv_2d_dw_s2_bias_op") == 0) {
++        return (void *)ggml_cpu_conv_2d_dw_s2_bias_op;
++    }
++    if (strcmp(name, "ggml_backend_cpu_conv_2d_pw_bias_relu_op") == 0) {
++        return (void *)ggml_cpu_conv_2d_pw_bias_relu_op;
++    }
+ #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+     if (strcmp(name, "ggml_backend_cpu_amx_set_q8_0_grouped") == 0) {
+         return (void *)ggml_backend_amx_set_q8_0_grouped;
