@@ -1525,9 +1525,9 @@ transcribe_status run(transcribe_session *          session,
                     commit_result();
                     return TRANSCRIBE_ERR_OOM;
                 }
-                DecoderBuild db_pass = build_decoder_graph_kv(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache,
-                                                              n_tok, n_past, T_enc, /*skip_log_softmax=*/true,
-                                                              cc->decoder_use_flash, /*argmax_all_rows=*/true);
+                DecoderBuild db_pass =
+                    build_decoder_graph_kv(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, n_tok, n_past,
+                                           T_enc, /*skip_log_softmax=*/true, cc->decoder_use_flash, /*n_out=*/n_tok);
                 if (db_pass.out == nullptr || db_pass.graph == nullptr) {
                     log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: decoder draft-pass graph build failed");
                     commit_result();

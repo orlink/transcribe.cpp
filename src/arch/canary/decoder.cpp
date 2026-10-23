@@ -355,14 +355,14 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
                                     int                   T_enc,
                                     bool                  skip_log_softmax,
                                     bool                  use_flash,
-                                    bool                  argmax_all_rows) {
+                                    int                   n_out) {
     DecoderBuild db{};
 
-    if (ctx == nullptr || n_tokens <= 0 || T_enc <= 0) {
+    if (ctx == nullptr || n_tokens <= 0 || T_enc <= 0 || n_out <= 0 || n_out > n_tokens) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                 "canary decoder_kv: invalid arg "
-                "(ctx=%p, n_tokens=%d, T_enc=%d)",
-                static_cast<void *>(ctx), n_tokens, T_enc);
+                "(ctx=%p, n_tokens=%d, T_enc=%d, n_out=%d)",
+                static_cast<void *>(ctx), n_tokens, T_enc, n_out);
         return db;
     }
 
@@ -480,6 +480,11 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
     x                        = named(x, "dec.out_before_head");
     db.dumps.out_before_head = x;
 
+    // Only the rows that are read back go through the LM head.
+    if (skip_log_softmax && n_out < n_tokens) {
+        x = ggml_view_2d(ctx, x, hidden, n_out, x->nb[1], x->nb[1] * static_cast<size_t>(n_tokens - n_out));
+    }
+
     // Untied LM head.
     ggml_tensor * logits = ggml_mul_mat(ctx, w.head.weight, x);
     if (w.head.bias != nullptr) {
@@ -500,14 +505,7 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
     ggml_set_output(db.out);
 
     if (skip_log_softmax) {
-        ggml_tensor * last_logits = logits;
-        if (n_tokens > 1 && !argmax_all_rows) {
-            const int64_t vocab     = logits->ne[0];
-            const size_t  row_bytes = ggml_element_size(logits) * vocab;
-            last_logits             = ggml_view_2d(ctx, logits, vocab, /*n=*/1, row_bytes, row_bytes * (n_tokens - 1));
-            last_logits             = ggml_cont(ctx, last_logits);
-        }
-        db.argmax_out = ggml_argmax(ctx, last_logits);
+        db.argmax_out = ggml_argmax(ctx, logits);
         ggml_set_name(db.argmax_out, "dec.argmax");
         ggml_set_output(db.argmax_out);
         ggml_build_forward_expand(db.graph, db.argmax_out);
