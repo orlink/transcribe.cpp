@@ -197,6 +197,14 @@ CanaryModel::~CanaryModel() {
         safe_buffer_free(conv_pw_f32_buffer);
         conv_pw_f32_buffer = nullptr;
     }
+    if (join_bias_buffer != nullptr) {
+        safe_buffer_free(join_bias_buffer);
+        join_bias_buffer = nullptr;
+    }
+    if (join_ctx != nullptr) {
+        ggml_free(join_ctx);
+        join_ctx = nullptr;
+    }
     if (ctx_meta != nullptr) {
         ggml_free(ctx_meta);
         ctx_meta = nullptr;
@@ -353,6 +361,110 @@ transcribe_status promote_conv_pw_to_f32_on_cpu(CanaryModel & m, const load_comm
     }
     return load_common::promote_conv_pw_f16_to_f32_on_cpu(m.plan, slots, "canary", &m.conv_pw_f32_ctx,
                                                           &m.conv_pw_f32_buffer);
+}
+
+// On a CPU primary, matrix weights that read the same input are joined at
+// load into one weight each (load_common::MulMatJoin), so one matmul, with
+// one quantization of its input, computes all their outputs: an encoder
+// block's Q, K and V, a decoder block's self-attention Q, K and V, and the
+// cross-attention K and V of all decoder layers (all over the encoder
+// output). Each output is the same dot product as before, so nothing
+// changes in the results. The joined biases are allocated here and filled
+// by fill_joined_biases after the load. TRANSCRIBE_NO_JOINED_MATMUL=1 keeps
+// the separate weights.
+struct JoinedBias {
+    ggml_tensor *              joined;
+    std::vector<ggml_tensor *> parts;
+};
+
+transcribe_status plan_weight_joins(CanaryModel &              m,
+                                    load_common::MulMatJoins & joins,
+                                    std::vector<JoinedBias> &  biases) {
+    if (m.plan.primary_kind != transcribe::BackendKind::Cpu || transcribe::env::flag("TRANSCRIBE_NO_JOINED_MATMUL")) {
+        return TRANSCRIBE_OK;
+    }
+    const size_t     n_join = m.weights.blocks.size() + m.weights.dec_blocks.size() + 1;
+    ggml_init_params params = { 2 * n_join * ggml_tensor_overhead() + 256, nullptr, true };
+    m.join_ctx              = ggml_init(params);
+    if (m.join_ctx == nullptr) {
+        return TRANSCRIBE_ERR_OOM;
+    }
+    // Joins `ws` (biases `bs`: all or none) into *w_slot / *b_slot, unless their types or row lengths differ.
+    auto join = [&](const std::vector<ggml_tensor *> & ws, const std::vector<ggml_tensor *> & bs, const char * name,
+                    ggml_tensor ** w_slot, ggml_tensor ** b_slot) {
+        int64_t rows     = 0;
+        size_t  n_biases = 0;
+        for (size_t i = 0; i < ws.size(); ++i) {
+            if (ws[i] == nullptr || ws[i]->type != ws[0]->type || ws[i]->ne[0] != ws[0]->ne[0] ||
+                ggml_n_dims(ws[i]) > 2) {
+                return;
+            }
+            if (bs[i] != nullptr && (bs[i]->type != GGML_TYPE_F32 || ggml_nelements(bs[i]) != ws[i]->ne[1])) {
+                return;
+            }
+            rows += ws[i]->ne[1];
+            n_biases += bs[i] != nullptr ? 1 : 0;
+        }
+        if (n_biases != 0 && n_biases != bs.size()) {
+            return;
+        }
+        ggml_tensor * w = ggml_new_tensor_2d(m.join_ctx, ws[0]->type, ws[0]->ne[0], rows);
+        ggml_set_name(w, name);
+        joins.push_back({ w, ws });
+        *w_slot = w;
+        if (n_biases != 0) {
+            ggml_tensor * b = ggml_new_tensor_1d(m.join_ctx, GGML_TYPE_F32, rows);
+            biases.push_back({ b, bs });
+            *b_slot = b;
+        }
+    };
+    char name[GGML_MAX_NAME];
+    for (size_t i = 0; i < m.weights.blocks.size(); ++i) {
+        CanaryBlock & b = m.weights.blocks[i];
+        std::snprintf(name, sizeof(name), "enc.blocks.%zu.attn.linear_qkv.weight", i);
+        join({ b.attn_q_w, b.attn_k_w, b.attn_v_w }, { b.attn_q_b, b.attn_k_b, b.attn_v_b }, name, &b.attn_qkv_w,
+             &b.attn_qkv_b);
+    }
+    std::vector<ggml_tensor *> kv_w, kv_b;
+    for (size_t i = 0; i < m.weights.dec_blocks.size(); ++i) {
+        CanaryDecBlock & b = m.weights.dec_blocks[i];
+        std::snprintf(name, sizeof(name), "dec.layer.%zu.self_attn.qkv.weight", i);
+        join({ b.self_q_w, b.self_k_w, b.self_v_w }, { b.self_q_b, b.self_k_b, b.self_v_b }, name, &b.self_qkv_w,
+             &b.self_qkv_b);
+        kv_w.insert(kv_w.end(), { b.cross_k_w, b.cross_v_w });
+        kv_b.insert(kv_b.end(), { b.cross_k_b, b.cross_v_b });
+    }
+    if (!kv_w.empty()) {
+        join(kv_w, kv_b, "dec.layers.cross_attn.kv.weight", &m.weights.dec_cross_kv_w, &m.weights.dec_cross_kv_b);
+    }
+    return TRANSCRIBE_OK;
+}
+
+// The joined biases: the parts' values one after another.
+transcribe_status fill_joined_biases(CanaryModel & m, const std::vector<JoinedBias> & biases) {
+    if (biases.empty()) {
+        return TRANSCRIBE_OK;
+    }
+    std::vector<ggml_tensor *> tensors;
+    for (const JoinedBias & jb : biases) {
+        tensors.push_back(jb.joined);
+    }
+    m.join_bias_buffer = ggml_backend_buft_alloc_buffer_n(ggml_backend_get_default_buffer_type(m.plan.primary),
+                                                          tensors.data(), static_cast<int>(tensors.size()));
+    if (m.join_bias_buffer == nullptr) {
+        return TRANSCRIBE_ERR_OOM;
+    }
+    std::vector<float> values;
+    for (const JoinedBias & jb : biases) {
+        values.resize(static_cast<size_t>(ggml_nelements(jb.joined)));
+        size_t done = 0;
+        for (ggml_tensor * p : jb.parts) {
+            ggml_backend_tensor_get(p, values.data() + done, 0, ggml_nbytes(p));
+            done += static_cast<size_t>(ggml_nelements(p));
+        }
+        ggml_backend_tensor_set(jb.joined, values.data(), 0, ggml_nbytes(jb.joined));
+    }
+    return TRANSCRIBE_OK;
 }
 
 // Weights the graphs use only as the first operand of ggml_mul_mat (see
@@ -549,15 +661,27 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     }
     const transcribe::load_common::ScopedCpuQ8_0Grouping grouped_layout(m->plan, grouping);
 
+    transcribe::load_common::MulMatJoins joins;
+    std::vector<JoinedBias>              joined_biases;
+    if (const transcribe_status st = plan_weight_joins(*m, joins, joined_biases); st != TRANSCRIBE_OK) {
+        gguf_free(gguf_data);
+        return st;
+    }
+
     const transcribe::load_common::MulMatWeights mul_mat_weights = canary_mul_mat_weights(m->weights);
-    if (const transcribe_status st = transcribe::load_common::load_weights(
-            loader.path(), gguf_data, m->ctx_meta, m->plan, params, "canary", m->weight_storage, &mul_mat_weights);
+    if (const transcribe_status st =
+            transcribe::load_common::load_weights(loader.path(), gguf_data, m->ctx_meta, m->plan, params, "canary",
+                                                  m->weight_storage, &mul_mat_weights, &joins);
         st != TRANSCRIBE_OK) {
         gguf_free(gguf_data);
         return st;
     }
 
     gguf_free(gguf_data);
+
+    if (const transcribe_status st = fill_joined_biases(*m, joined_biases); st != TRANSCRIBE_OK) {
+        return st;
+    }
 
     if (const transcribe_status st = fuse_batch_norm(*m); st != TRANSCRIBE_OK) {
         return st;

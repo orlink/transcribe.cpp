@@ -665,14 +665,40 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
 
     // Q, K, V, P projections. Q/K/V may have bias (Cohere) or not
     // (Parakeet); the pos projection (attn_pos_w) never has a bias.
-    ggml_tensor * q = ggml_mul_mat(ctx, b.attn_q_w, q_sliced ? x_q : x);
-    if (b.attn_q_b != nullptr) {
-        q = ggml_add(ctx, q, b.attn_q_b);
+    // With the joined weight one matmul gives [3*d_model, T, B], and Q, K
+    // and V are its column ranges, viewed as [head_dim, n_head, T, B].
+    ggml_tensor * q4 = nullptr;
+    ggml_tensor * k4 = nullptr;
+    ggml_tensor * v4 = nullptr;
+    if (b.attn_qkv_w != nullptr) {
+        if (rect || params.window_chunk > 0) {
+            std::fprintf(stderr, "conformer rel_pos_mhsa: joined Q/K/V weights need full self-attention\n");
+            return nullptr;
+        }
+        ggml_tensor * qkv = ggml_mul_mat(ctx, b.attn_qkv_w, x);
+        if (b.attn_qkv_b != nullptr) {
+            qkv = ggml_add(ctx, qkv, b.attn_qkv_b);
+        }
+        const size_t es    = ggml_element_size(qkv);
+        auto         split = [&](int i) {
+            return ggml_view_4d(ctx, qkv, head_dim, n_head, T_kv, B, head_dim * es, qkv->nb[1], qkv->nb[2],
+                                static_cast<size_t>(i) * d_model * es);
+        };
+        q4 = split(0);
+        k4 = split(1);
+        v4 = split(2);
+    }
+    ggml_tensor * q = q4;
+    if (q == nullptr) {
+        q = ggml_mul_mat(ctx, b.attn_q_w, q_sliced ? x_q : x);
+        if (b.attn_q_b != nullptr) {
+            q = ggml_add(ctx, q, b.attn_q_b);
+        }
     }
     // KV-cache mode: keys/values arrive pre-projected (bias included).
     ggml_tensor * k = k_full;
     ggml_tensor * v = v_full;
-    if (!kv_cached) {
+    if (!kv_cached && q4 == nullptr) {
         k = ggml_mul_mat(ctx, b.attn_k_w, x);
         if (b.attn_k_b != nullptr) {
             k = ggml_add(ctx, k, b.attn_k_b);
@@ -836,7 +862,7 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
 
     // Split heads: [head_dim, n_head, T, B] (batch at ne[3]). pos_bias_u/v
     // broadcast onto this BEFORE the permute that moves T past n_head.
-    q                 = ggml_reshape_4d(ctx, q, head_dim, n_head, T_q, B);
+    q                 = q4 != nullptr ? q4 : ggml_reshape_4d(ctx, q, head_dim, n_head, T_q, B);
     ggml_tensor * q_u = ggml_add(ctx, q, b.attn_pos_u);
     ggml_tensor * q_v = ggml_add(ctx, q, b.attn_pos_v);
 
@@ -849,10 +875,10 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
     ggml_tensor * q_v_perm = ggml_permute(ctx, q_v, 0, 2, 1, 3);
     q_v                    = ggml_cont(ctx, q_v_perm);
 
-    k = ggml_reshape_4d(ctx, k, head_dim, n_head, T_kv, B);
+    k = k4 != nullptr ? k4 : ggml_reshape_4d(ctx, k, head_dim, n_head, T_kv, B);
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
 
-    v = ggml_reshape_4d(ctx, v, head_dim, n_head, T_kv, B);
+    v = v4 != nullptr ? v4 : ggml_reshape_4d(ctx, v, head_dim, n_head, T_kv, B);
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
     // Position scores are batch-independent (pos_emb has no batch axis), so

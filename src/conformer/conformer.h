@@ -70,6 +70,12 @@ struct BlockView {
     ggml_tensor * attn_pos_w  = nullptr;  // [d_model, d_model] linear_pos (no bias)
     ggml_tensor * attn_pos_u  = nullptr;  // [n_head, head_dim]
     ggml_tensor * attn_pos_v  = nullptr;  // [n_head, head_dim]
+    // Optional: attn_q / k / v joined into one [d_model, 3*d_model] weight
+    // (rows q, then k, then v) and its bias (nullable), computed by one
+    // matmul. Only for full self-attention (no query split, cached K/V or
+    // windowed attention); the separate weights are then not used.
+    ggml_tensor * attn_qkv_w  = nullptr;
+    ggml_tensor * attn_qkv_b  = nullptr;
 
     // Convolution module. Pointwise conv1 is 2*d_model for GLU.
     ggml_tensor * norm_conv_w         = nullptr;  // [d_model]

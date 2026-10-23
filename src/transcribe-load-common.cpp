@@ -465,7 +465,15 @@ void WeightStorage::reset() noexcept {
         safe_buffer_free(b);
     }
     repack_buffers_.clear();
+    safe_buffer_free(join_buffer_);
+    join_buffer_ = nullptr;
+    joins_.clear();
+    dropped_.clear();
     file_.reset();
+}
+
+bool WeightStorage::is_dropped(const ggml_tensor * t) const noexcept {
+    return t != nullptr && std::find(dropped_.begin(), dropped_.end(), t) != dropped_.end();
 }
 
 bool WeightStorage::is_mapped(const ggml_tensor * t) const noexcept {
@@ -594,6 +602,7 @@ struct MapCounts {
 transcribe_status map_weights(const std::string &     path,
                               const gguf_context *    gguf_data,
                               ggml_context *          ctx_meta,
+                              const WeightStorage &   storage,
                               ggml_backend_dev_t      dev,
                               const char *            error_tag,
                               MappedFile &            file,
@@ -620,8 +629,8 @@ transcribe_status map_weights(const std::string &     path,
     size_t                 max_tensor_size = 0;
     if (data_offset <= file_size) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx_meta); t != nullptr; t = ggml_get_next_tensor(ctx_meta, t)) {
-            if (t->data != nullptr || t->buffer != nullptr || t->view_src != nullptr) {
-                continue;  // already has storage
+            if (t->data != nullptr || t->buffer != nullptr || t->view_src != nullptr || storage.is_dropped(t)) {
+                continue;  // already has storage, or gets none
             }
             const int64_t idx = gguf_find_tensor(gguf_data, ggml_get_name(t));
             if (idx < 0) {
@@ -697,14 +706,13 @@ transcribe_status allocate_copied_weights(ggml_context *      ctx_meta,
                                           const BackendPlan & plan,
                                           const char *        error_tag,
                                           WeightStorage &     out) {
-    bool any_unallocated = false;
+    std::vector<ggml_tensor *> todo;
     for (ggml_tensor * t = ggml_get_first_tensor(ctx_meta); t != nullptr; t = ggml_get_next_tensor(ctx_meta, t)) {
-        if (t->data == nullptr && t->view_src == nullptr) {
-            any_unallocated = true;
-            break;
+        if (t->data == nullptr && t->view_src == nullptr && !out.is_dropped(t)) {
+            todo.push_back(t);
         }
     }
-    if (!any_unallocated) {
+    if (todo.empty()) {
         return TRANSCRIBE_OK;
     }
     if (out.copy_buffer_ != nullptr || plan.primary == nullptr) {
@@ -712,8 +720,11 @@ transcribe_status allocate_copied_weights(ggml_context *      ctx_meta,
         return TRANSCRIBE_ERR_BACKEND;
     }
 
-    // Allocates only the tensors that have no storage yet.
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx_meta, plan.primary);
+    // Allocates only the tensors that have no storage yet (and are not the parts of a joined weight).
+    ggml_backend_buffer_t buffer =
+        out.dropped_.empty() ? ggml_backend_alloc_ctx_tensors(ctx_meta, plan.primary) :
+                               ggml_backend_buft_alloc_buffer_n(ggml_backend_get_default_buffer_type(plan.primary),
+                                                                todo.data(), static_cast<int>(todo.size()));
     if (buffer == nullptr) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: ggml_backend_alloc_ctx_tensors failed", error_tag);
         return TRANSCRIBE_ERR_OOM;
@@ -730,18 +741,57 @@ transcribe_status allocate_weights(const std::string &                  path,
                                    const transcribe_model_load_params * params,
                                    const char *                         error_tag,
                                    WeightStorage &                      out,
-                                   const MulMatWeights *                mul_mat_weights) {
+                                   const MulMatWeights *                mul_mat_weights,
+                                   const MulMatJoins *                  joins) {
     if (plan.primary == nullptr || gguf_data == nullptr || ctx_meta == nullptr) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
     ggml_backend_dev_t dev = ggml_backend_get_device(plan.primary);
 
+    // Joined weights: checked, their parts marked as getting no storage.
+    std::vector<ggml_tensor *> joined;
+    if (joins != nullptr && !joins->empty()) {
+        if (plan.primary_kind != BackendKind::Cpu) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: joined matrix weights need a CPU primary", error_tag);
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+        for (const MulMatJoin & j : *joins) {
+            ggml_tensor * w    = j.joined;
+            bool          ok   = w != nullptr && w->data == nullptr && w->buffer == nullptr && w->view_src == nullptr &&
+                                 ggml_n_dims(w) <= 2 && !j.parts.empty();
+            int64_t       rows = 0;
+            for (const ggml_tensor * p : j.parts) {
+                ok = ok && p != nullptr && p->type == w->type && p->ne[0] == w->ne[0] && ggml_n_dims(p) <= 2 &&
+                     ggml_is_contiguous(p) && p->data == nullptr && p->buffer == nullptr && p->view_src == nullptr &&
+                     gguf_find_tensor(gguf_data, ggml_get_name(p)) >= 0;
+                rows += ok ? p->ne[1] : 0;
+            }
+            if (!ok || rows != w->ne[1]) {
+                log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: joined weight \"%s\" does not match its parts", error_tag,
+                        w != nullptr ? ggml_get_name(w) : "?");
+                return TRANSCRIBE_ERR_INVALID_ARG;
+            }
+            out.dropped_.insert(out.dropped_.end(), j.parts.begin(), j.parts.end());
+            joined.push_back(w);
+        }
+        out.joins_ = *joins;
+    }
+
     // CPU extra buffer types first: their tensors then have storage, so the
     // mapping and the copy buffer leave them alone.
-    if (mul_mat_weights != nullptr && !mul_mat_weights->empty() && plan.primary_kind == BackendKind::Cpu &&
-        cpu_repack_allowed()) {
+    if (((mul_mat_weights != nullptr && !mul_mat_weights->empty()) || !joined.empty()) &&
+        plan.primary_kind == BackendKind::Cpu && cpu_repack_allowed()) {
+        std::vector<ggml_tensor *> candidates;
+        if (mul_mat_weights != nullptr) {
+            for (ggml_tensor * t : *mul_mat_weights) {
+                if (!out.is_dropped(t)) {
+                    candidates.push_back(t);
+                }
+            }
+        }
+        candidates.insert(candidates.end(), joined.begin(), joined.end());
         std::vector<std::pair<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>>> groups;
-        for (ggml_tensor * t : *mul_mat_weights) {
+        for (ggml_tensor * t : candidates) {
             ggml_backend_buffer_type_t buft = cpu_repack_buft_for(dev, t);
             if (buft == nullptr) {
                 continue;
@@ -766,6 +816,27 @@ transcribe_status allocate_weights(const std::string &                  path,
         }
     }
 
+    // Joined weights no extra buffer type took: an ordinary buffer.
+    std::vector<ggml_tensor *> plain;
+    for (ggml_tensor * t : joined) {
+        if (t->buffer == nullptr) {
+            plain.push_back(t);
+        }
+    }
+    if (!plain.empty()) {
+        out.join_buffer_ = ggml_backend_buft_alloc_buffer_n(ggml_backend_get_default_buffer_type(plan.primary),
+                                                            plain.data(), static_cast<int>(plain.size()));
+        if (out.join_buffer_ == nullptr) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: cannot allocate the joined matrix weights", error_tag);
+            return TRANSCRIBE_ERR_OOM;
+        }
+        ggml_backend_buffer_set_usage(out.join_buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+    if (!joined.empty()) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "%s: %zu matrix weights joined from %zu", error_tag, joined.size(),
+                out.dropped_.size());
+    }
+
     std::string why;
     MapCounts   counts;
     if (!mmap_allowed(params)) {
@@ -774,8 +845,8 @@ transcribe_status allocate_weights(const std::string &                  path,
         why = "memory mapping unsupported on this platform";
     } else if (!device_can_map(plan, dev)) {
         why = "device keeps weights in its own memory";
-    } else if (const transcribe_status st =
-                   map_weights(path, gguf_data, ctx_meta, dev, error_tag, out.file_, out.mapped_buffer_, counts, why);
+    } else if (const transcribe_status st = map_weights(path, gguf_data, ctx_meta, out, dev, error_tag, out.file_,
+                                                        out.mapped_buffer_, counts, why);
                st != TRANSCRIBE_OK) {
         return st;
     }
@@ -822,9 +893,10 @@ transcribe_status load_weights(const std::string &                  path,
                                const transcribe_model_load_params * params,
                                const char *                         error_tag,
                                WeightStorage &                      out,
-                               const MulMatWeights *                mul_mat_weights) {
+                               const MulMatWeights *                mul_mat_weights,
+                               const MulMatJoins *                  joins) {
     if (const transcribe_status st =
-            allocate_weights(path, gguf_data, ctx_meta, plan, params, error_tag, out, mul_mat_weights);
+            allocate_weights(path, gguf_data, ctx_meta, plan, params, error_tag, out, mul_mat_weights, joins);
         st != TRANSCRIBE_OK) {
         return st;
     }
@@ -857,8 +929,8 @@ transcribe_status stream_tensor_data(const std::string &   path,
     std::vector<uint8_t> staging;
 
     for (ggml_tensor * t = ggml_get_first_tensor(ctx_meta); t != nullptr; t = ggml_get_next_tensor(ctx_meta, t)) {
-        if (skip != nullptr && skip->is_mapped(t)) {
-            continue;  // already backed by the file bytes
+        if (skip != nullptr && (skip->is_mapped(t) || skip->is_dropped(t))) {
+            continue;  // already backed by the file bytes, or read into a joined weight below
         }
         const int64_t idx = gguf_find_tensor(gguf_data, t->name);
         if (idx < 0) {
@@ -907,6 +979,40 @@ transcribe_status stream_tensor_data(const std::string &   path,
             }
             ggml_backend_tensor_set(t, staging.data(), done, n);
             done += n;
+        }
+    }
+
+    // Joined weights: their parts' bytes one after another, in one write (repacked buffers convert whole tensors).
+    if (skip != nullptr) {
+        for (const MulMatJoin & j : skip->joins()) {
+            const size_t nbytes = ggml_nbytes(j.joined);
+            const bool   direct = !skip->is_repacked(j.joined) && ggml_backend_buffer_is_host(j.joined->buffer);
+            if (!direct && staging.size() < nbytes) {
+                staging.resize(nbytes);
+            }
+            char * dst  = direct ? static_cast<char *>(j.joined->data) : reinterpret_cast<char *>(staging.data());
+            size_t done = 0;
+            for (const ggml_tensor * p : j.parts) {
+                const int64_t idx = gguf_find_tensor(gguf_data, ggml_get_name(p));
+                const size_t  n   = ggml_nbytes(p);
+                if (idx < 0 || done + n > nbytes) {
+                    log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: tensor \"%s\" not in gguf data", error_tag,
+                            ggml_get_name(p));
+                    return TRANSCRIBE_ERR_GGUF;
+                }
+                fin.seekg(static_cast<std::streamoff>(data_offset) +
+                          static_cast<std::streamoff>(gguf_get_tensor_offset(gguf_data, idx)));
+                fin.read(dst + done, static_cast<std::streamsize>(n));
+                if (!fin) {
+                    log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: short read for tensor \"%s\" (%zu bytes)", error_tag,
+                            ggml_get_name(p), n);
+                    return TRANSCRIBE_ERR_GGUF;
+                }
+                done += n;
+            }
+            if (!direct) {
+                ggml_backend_tensor_set(j.joined, staging.data(), 0, nbytes);
+            }
         }
     }
 

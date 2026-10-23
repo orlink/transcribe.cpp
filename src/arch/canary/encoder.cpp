@@ -77,6 +77,8 @@ conf::BlockView to_view(const CanaryBlock & b) {
     v.attn_pos_w  = b.attn_pos_w;
     v.attn_pos_u  = b.attn_pos_u;
     v.attn_pos_v  = b.attn_pos_v;
+    v.attn_qkv_w  = b.attn_qkv_w;
+    v.attn_qkv_b  = b.attn_qkv_b;
 
     v.norm_conv_w         = b.norm_conv_w;
     v.norm_conv_b         = b.norm_conv_b;

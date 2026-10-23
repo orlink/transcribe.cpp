@@ -36,47 +36,64 @@ ggml_tensor * layer_norm(ggml_context * ctx, ggml_tensor * x, ggml_tensor * gamm
     return y;
 }
 
+// Self-attention Q, K and V of x ([hidden, n] or [hidden, n, B]), biases
+// added: three matmuls, or one over the joined weight, whose column ranges
+// are then views with rows 3 * hidden apart.
+struct SelfQkv {
+    ggml_tensor * q;
+    ggml_tensor * k;
+    ggml_tensor * v;
+};
+
+SelfQkv self_qkv(ggml_context * ctx, ggml_tensor * x, const CanaryDecBlock & blk, int64_t hidden) {
+    if (blk.self_qkv_w != nullptr) {
+        ggml_tensor * qkv = ggml_mul_mat(ctx, blk.self_qkv_w, x);
+        if (blk.self_qkv_b != nullptr) {
+            qkv = ggml_add(ctx, qkv, blk.self_qkv_b);
+        }
+        const size_t es   = ggml_element_size(qkv);
+        auto         part = [&](int i) {
+            return ggml_view_3d(ctx, qkv, hidden, qkv->ne[1], qkv->ne[2], qkv->nb[1], qkv->nb[2],
+                                static_cast<size_t>(i) * hidden * es);
+        };
+        return { part(0), part(1), part(2) };
+    }
+    auto proj = [&](ggml_tensor * w, ggml_tensor * b) {
+        ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+        return b != nullptr ? ggml_add(ctx, y, b) : y;
+    };
+    return { proj(blk.self_q_w, blk.self_q_b), proj(blk.self_k_w, blk.self_k_b), proj(blk.self_v_w, blk.self_v_b) };
+}
+
+// t ([hidden, n], rows t->nb[1] apart) as [head_dim, n_heads, n]: a view, as t may be a column range.
+ggml_tensor * split_heads(ggml_context * ctx, ggml_tensor * t, int head_dim, int n_heads, int64_t n) {
+    return ggml_view_3d(ctx, t, head_dim, n_heads, n, head_dim * ggml_element_size(t), t->nb[1], 0);
+}
+
 // Self-attention with KV cache. Mirrors cohere's mha_self_cached.
-ggml_tensor * mha_self_cached(ggml_context *  ctx,
-                              ggml_cgraph *   gf,
-                              ggml_tensor *   x,
-                              CanaryKvCache & kv_cache,
-                              ggml_tensor *   mask,
-                              ggml_tensor *   q_w,
-                              ggml_tensor *   q_b,
-                              ggml_tensor *   k_w,
-                              ggml_tensor *   k_b,
-                              ggml_tensor *   v_w,
-                              ggml_tensor *   v_b,
-                              ggml_tensor *   out_w,
-                              ggml_tensor *   out_b,
-                              int             n_heads,
-                              int             hidden,
-                              int             il,
-                              int             n_past,
-                              int             n_tokens,
-                              bool            use_flash) {
+ggml_tensor * mha_self_cached(ggml_context *         ctx,
+                              ggml_cgraph *          gf,
+                              ggml_tensor *          x,
+                              CanaryKvCache &        kv_cache,
+                              ggml_tensor *          mask,
+                              const CanaryDecBlock & blk,
+                              int                    n_heads,
+                              int                    hidden,
+                              int                    il,
+                              int                    n_past,
+                              int                    n_tokens,
+                              bool                   use_flash) {
     const int   head_dim = hidden / n_heads;
     const float scale    = 1.0f / std::sqrt(static_cast<float>(head_dim));
     const int   n_ctx    = kv_cache.n_ctx;
     const int   n_kv     = n_past + n_tokens;
 
-    ggml_tensor * Qcur = ggml_mul_mat(ctx, q_w, x);
-    if (q_b != nullptr) {
-        Qcur = ggml_add(ctx, Qcur, q_b);
-    }
+    const SelfQkv qkv  = self_qkv(ctx, x, blk, hidden);
+    ggml_tensor * Qcur = qkv.q;
+    ggml_tensor * Kcur = qkv.k;
+    ggml_tensor * Vcur = qkv.v;
 
-    ggml_tensor * Kcur = ggml_mul_mat(ctx, k_w, x);
-    if (k_b != nullptr) {
-        Kcur = ggml_add(ctx, Kcur, k_b);
-    }
-
-    ggml_tensor * Vcur = ggml_mul_mat(ctx, v_w, x);
-    if (v_b != nullptr) {
-        Vcur = ggml_add(ctx, Vcur, v_b);
-    }
-
-    ggml_tensor * Q = ggml_reshape_3d(ctx, Qcur, head_dim, n_heads, n_tokens);
+    ggml_tensor * Q = split_heads(ctx, Qcur, head_dim, n_heads, n_tokens);
     Q               = ggml_permute(ctx, Q, 0, 2, 1, 3);
 
     {
@@ -118,9 +135,9 @@ ggml_tensor * mha_self_cached(ggml_context *  ctx,
         o                     = ggml_reshape_2d(ctx, o, hidden, n_tokens);
     }
 
-    o = ggml_mul_mat(ctx, out_w, o);
-    if (out_b != nullptr) {
-        o = ggml_add(ctx, o, out_b);
+    o = ggml_mul_mat(ctx, blk.self_o_w, o);
+    if (blk.self_o_b != nullptr) {
+        o = ggml_add(ctx, o, blk.self_o_b);
     }
     return o;
 }
@@ -129,45 +146,28 @@ ggml_tensor * mha_self_cached(ggml_context *  ctx,
 // go through ggml_set_rows at runtime row index `kv_idx`; reads span
 // the full [0, max_n_kv) window with `mask` gating valid positions.
 // n_tokens is implicitly 1.
-ggml_tensor * mha_self_step(ggml_context *  ctx,
-                            ggml_cgraph *   gf,
-                            ggml_tensor *   x,
-                            CanaryKvCache & kv_cache,
-                            ggml_tensor *   mask,
-                            ggml_tensor *   kv_idx,
-                            ggml_tensor *   q_w,
-                            ggml_tensor *   q_b,
-                            ggml_tensor *   k_w,
-                            ggml_tensor *   k_b,
-                            ggml_tensor *   v_w,
-                            ggml_tensor *   v_b,
-                            ggml_tensor *   out_w,
-                            ggml_tensor *   out_b,
-                            int             n_heads,
-                            int             hidden,
-                            int             il,
-                            int             max_n_kv,
-                            bool            use_flash) {
+ggml_tensor * mha_self_step(ggml_context *         ctx,
+                            ggml_cgraph *          gf,
+                            ggml_tensor *          x,
+                            CanaryKvCache &        kv_cache,
+                            ggml_tensor *          mask,
+                            ggml_tensor *          kv_idx,
+                            const CanaryDecBlock & blk,
+                            int                    n_heads,
+                            int                    hidden,
+                            int                    il,
+                            int                    max_n_kv,
+                            bool                   use_flash) {
     const int   head_dim = hidden / n_heads;
     const float scale    = 1.0f / std::sqrt(static_cast<float>(head_dim));
     const int   n_ctx    = kv_cache.n_ctx;
 
-    ggml_tensor * Qcur = ggml_mul_mat(ctx, q_w, x);
-    if (q_b != nullptr) {
-        Qcur = ggml_add(ctx, Qcur, q_b);
-    }
+    const SelfQkv qkv  = self_qkv(ctx, x, blk, hidden);
+    ggml_tensor * Qcur = qkv.q;
+    ggml_tensor * Kcur = qkv.k;
+    ggml_tensor * Vcur = qkv.v;
 
-    ggml_tensor * Kcur = ggml_mul_mat(ctx, k_w, x);
-    if (k_b != nullptr) {
-        Kcur = ggml_add(ctx, Kcur, k_b);
-    }
-
-    ggml_tensor * Vcur = ggml_mul_mat(ctx, v_w, x);
-    if (v_b != nullptr) {
-        Vcur = ggml_add(ctx, Vcur, v_b);
-    }
-
-    ggml_tensor * Q = ggml_reshape_3d(ctx, Qcur, head_dim, n_heads, /*n_tokens=*/1);
+    ggml_tensor * Q = split_heads(ctx, Qcur, head_dim, n_heads, /*n_tokens=*/1);
     Q               = ggml_permute(ctx, Q, 0, 2, 1, 3);
 
     // KV cache write via ggml_set_rows. Static topology — only kv_idx's
@@ -182,8 +182,8 @@ ggml_tensor * mha_self_step(ggml_context *  ctx,
         ggml_tensor * k_layer = ggml_view_2d(ctx, kv_cache.self_k, hidden, n_ctx, k_elem * hidden, layer_off_k);
         ggml_tensor * v_layer = ggml_view_2d(ctx, kv_cache.self_v, hidden, n_ctx, v_elem * hidden, layer_off_v);
 
-        ggml_tensor * K_row = ggml_reshape_2d(ctx, Kcur, hidden, 1);
-        ggml_tensor * V_row = ggml_reshape_2d(ctx, Vcur, hidden, 1);
+        ggml_tensor * K_row = ggml_view_2d(ctx, Kcur, hidden, 1, Kcur->nb[1], 0);
+        ggml_tensor * V_row = ggml_view_2d(ctx, Vcur, hidden, 1, Vcur->nb[1], 0);
 
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_layer, K_row, kv_idx));
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_layer, V_row, kv_idx));
@@ -216,9 +216,9 @@ ggml_tensor * mha_self_step(ggml_context *  ctx,
         o                     = ggml_reshape_2d(ctx, o, hidden, 1);
     }
 
-    o = ggml_mul_mat(ctx, out_w, o);
-    if (out_b != nullptr) {
-        o = ggml_add(ctx, o, out_b);
+    o = ggml_mul_mat(ctx, blk.self_o_w, o);
+    if (blk.self_o_b != nullptr) {
+        o = ggml_add(ctx, o, blk.self_o_b);
     }
     return o;
 }
@@ -318,17 +318,34 @@ DecoderBuild build_cross_kv_graph(ggml_context *        ctx,
         return db;
     }
 
+    // With the joined weight one matmul gives every layer's K and V as column ranges of [2 hidden n_layers, T_enc].
+    ggml_tensor * kv = nullptr;
+    if (w.dec_cross_kv_w != nullptr) {
+        kv = ggml_mul_mat(ctx, w.dec_cross_kv_w, db.encoder_out_in);
+        if (w.dec_cross_kv_b != nullptr) {
+            kv = ggml_add(ctx, kv, w.dec_cross_kv_b);
+        }
+    }
+
     for (int il = 0; il < hp.dec_n_layers; ++il) {
         const auto & blk = w.dec_blocks[il];
 
-        ggml_tensor * Kcross = ggml_mul_mat(ctx, blk.cross_k_w, db.encoder_out_in);
-        if (blk.cross_k_b != nullptr) {
-            Kcross = ggml_add(ctx, Kcross, blk.cross_k_b);
-        }
+        ggml_tensor * Kcross = nullptr;
+        ggml_tensor * Vcross = nullptr;
+        if (kv != nullptr) {
+            const size_t off = ggml_element_size(kv) * static_cast<size_t>(2 * il) * hidden;
+            Kcross           = ggml_view_2d(ctx, kv, hidden, T_enc, kv->nb[1], off);
+            Vcross           = ggml_view_2d(ctx, kv, hidden, T_enc, kv->nb[1], off + ggml_element_size(kv) * hidden);
+        } else {
+            Kcross = ggml_mul_mat(ctx, blk.cross_k_w, db.encoder_out_in);
+            if (blk.cross_k_b != nullptr) {
+                Kcross = ggml_add(ctx, Kcross, blk.cross_k_b);
+            }
 
-        ggml_tensor * Vcross = ggml_mul_mat(ctx, blk.cross_v_w, db.encoder_out_in);
-        if (blk.cross_v_b != nullptr) {
-            Vcross = ggml_add(ctx, Vcross, blk.cross_v_b);
+            Vcross = ggml_mul_mat(ctx, blk.cross_v_w, db.encoder_out_in);
+            if (blk.cross_v_b != nullptr) {
+                Vcross = ggml_add(ctx, Vcross, blk.cross_v_b);
+            }
         }
 
         ggml_tensor * k_dst = ggml_view_1d(
@@ -417,11 +434,9 @@ DecoderBuild build_decoder_graph_kv(ggml_context *        ctx,
         // norm1 + self-attention. NeMo's forward_hook captures the sublayer
         // output BEFORE the residual add, so we dump self_out, not x.
         {
-            ggml_tensor * x_norm = layer_norm(ctx, x, blk.norm1_w, blk.norm1_b);
-            ggml_tensor * self_out =
-                mha_self_cached(ctx, db.graph, x_norm, kv_cache, causal_mask, blk.self_q_w, blk.self_q_b, blk.self_k_w,
-                                blk.self_k_b, blk.self_v_w, blk.self_v_b, blk.self_o_w, blk.self_o_b, n_heads,
-                                static_cast<int>(hidden), i, n_past, n_tokens, use_flash);
+            ggml_tensor * x_norm   = layer_norm(ctx, x, blk.norm1_w, blk.norm1_b);
+            ggml_tensor * self_out = mha_self_cached(ctx, db.graph, x_norm, kv_cache, causal_mask, blk, n_heads,
+                                                     static_cast<int>(hidden), i, n_past, n_tokens, use_flash);
             if (dump_this) {
                 char bname[64];
                 std::snprintf(bname, sizeof(bname), "dec.layer.%d.self_attn.out", i);
@@ -570,12 +585,10 @@ StepBuild build_step_graph(ggml_context *        ctx,
         const auto & blk = w.dec_blocks[i];
 
         {
-            ggml_tensor * x_norm = layer_norm(ctx, x, blk.norm1_w, blk.norm1_b);
-            ggml_tensor * self_out =
-                mha_self_step(ctx, sb.graph, x_norm, kv_cache, sb.mask_in, sb.kv_idx_in, blk.self_q_w, blk.self_q_b,
-                              blk.self_k_w, blk.self_k_b, blk.self_v_w, blk.self_v_b, blk.self_o_w, blk.self_o_b,
-                              n_heads, static_cast<int>(hidden), i, max_n_kv, use_flash);
-            x = ggml_add(ctx, x, self_out);
+            ggml_tensor * x_norm   = layer_norm(ctx, x, blk.norm1_w, blk.norm1_b);
+            ggml_tensor * self_out = mha_self_step(ctx, sb.graph, x_norm, kv_cache, sb.mask_in, sb.kv_idx_in, blk,
+                                                   n_heads, static_cast<int>(hidden), i, max_n_kv, use_flash);
+            x                      = ggml_add(ctx, x, self_out);
         }
 
         // norm2 + cross-attention. cross_k/v are pre-populated full T_enc.
@@ -628,45 +641,30 @@ StepBuild build_step_graph(ggml_context *        ctx,
 namespace {
 
 // Batched self-attention step. x: [hidden, B] (one token per utterance).
-ggml_tensor * mha_self_step_batched(ggml_context *  ctx,
-                                    ggml_cgraph *   gf,
-                                    ggml_tensor *   x,
-                                    CanaryKvCache & kv_cache,
-                                    ggml_tensor *   mask,
-                                    ggml_tensor *   kv_idx,
-                                    ggml_tensor *   q_w,
-                                    ggml_tensor *   q_b,
-                                    ggml_tensor *   k_w,
-                                    ggml_tensor *   k_b,
-                                    ggml_tensor *   v_w,
-                                    ggml_tensor *   v_b,
-                                    ggml_tensor *   out_w,
-                                    ggml_tensor *   out_b,
-                                    int             n_heads,
-                                    int             hidden,
-                                    int             il,
-                                    int             max_n_kv,
-                                    int             B) {
+ggml_tensor * mha_self_step_batched(ggml_context *         ctx,
+                                    ggml_cgraph *          gf,
+                                    ggml_tensor *          x,
+                                    CanaryKvCache &        kv_cache,
+                                    ggml_tensor *          mask,
+                                    ggml_tensor *          kv_idx,
+                                    const CanaryDecBlock & blk,
+                                    int                    n_heads,
+                                    int                    hidden,
+                                    int                    il,
+                                    int                    max_n_kv,
+                                    int                    B) {
     const int     head_dim = hidden / n_heads;
     const float   scale    = 1.0f / std::sqrt(static_cast<float>(head_dim));
     const int64_t n_ctx    = kv_cache.n_ctx;
     const size_t  k_elem   = ggml_element_size(kv_cache.self_k);
     const size_t  v_elem   = ggml_element_size(kv_cache.self_v);
 
-    ggml_tensor * Qcur = ggml_mul_mat(ctx, q_w, x);
-    if (q_b != nullptr) {
-        Qcur = ggml_add(ctx, Qcur, q_b);
-    }
-    ggml_tensor * Kcur = ggml_mul_mat(ctx, k_w, x);
-    if (k_b != nullptr) {
-        Kcur = ggml_add(ctx, Kcur, k_b);
-    }
-    ggml_tensor * Vcur = ggml_mul_mat(ctx, v_w, x);
-    if (v_b != nullptr) {
-        Vcur = ggml_add(ctx, Vcur, v_b);
-    }
+    const SelfQkv qkv  = self_qkv(ctx, x, blk, hidden);
+    ggml_tensor * Qcur = qkv.q;
+    ggml_tensor * Kcur = qkv.k;
+    ggml_tensor * Vcur = qkv.v;
 
-    ggml_tensor * Q = ggml_reshape_3d(ctx, Qcur, head_dim, n_heads, B);
+    ggml_tensor * Q = split_heads(ctx, Qcur, head_dim, n_heads, B);
 
     {
         const size_t  off_k = k_elem * static_cast<size_t>(il) * n_ctx * hidden * B;
@@ -675,8 +673,8 @@ ggml_tensor * mha_self_step_batched(ggml_context *  ctx,
             ggml_view_3d(ctx, kv_cache.self_k, hidden, n_ctx, B, k_elem * hidden, k_elem * hidden * n_ctx, off_k);
         ggml_tensor * v_layer =
             ggml_view_3d(ctx, kv_cache.self_v, hidden, n_ctx, B, v_elem * hidden, v_elem * hidden * n_ctx, off_v);
-        ggml_tensor * K_row = ggml_reshape_3d(ctx, Kcur, hidden, 1, B);
-        ggml_tensor * V_row = ggml_reshape_3d(ctx, Vcur, hidden, 1, B);
+        ggml_tensor * K_row = ggml_view_3d(ctx, Kcur, hidden, 1, B, Kcur->nb[1], Kcur->nb[1], 0);
+        ggml_tensor * V_row = ggml_view_3d(ctx, Vcur, hidden, 1, B, Vcur->nb[1], Vcur->nb[1], 0);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_layer, K_row, kv_idx));
         ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_layer, V_row, kv_idx));
     }
@@ -692,9 +690,9 @@ ggml_tensor * mha_self_step_batched(ggml_context *  ctx,
     ggml_tensor * o     = ggml_flash_attn_ext(ctx, Q_att, K, V, mask, scale, 0.0f, 0.0f);
     o                   = ggml_reshape_2d(ctx, o, hidden, B);
 
-    o = ggml_mul_mat(ctx, out_w, o);
-    if (out_b != nullptr) {
-        o = ggml_add(ctx, o, out_b);
+    o = ggml_mul_mat(ctx, blk.self_o_w, o);
+    if (blk.self_o_b != nullptr) {
+        o = ggml_add(ctx, o, blk.self_o_b);
     }
     return o;
 }
@@ -770,16 +768,33 @@ DecoderBuild build_cross_kv_graph_batched(ggml_context *        ctx,
     const size_t k_elem = ggml_element_size(kv_cache.cross_k);
     const size_t v_elem = ggml_element_size(kv_cache.cross_v);
 
+    ggml_tensor * kv = nullptr;  // as in build_cross_kv_graph, [2 hidden n_layers, T_enc_max, B]
+    if (w.dec_cross_kv_w != nullptr) {
+        kv = ggml_mul_mat(ctx, w.dec_cross_kv_w, db.encoder_out_in);
+        if (w.dec_cross_kv_b != nullptr) {
+            kv = ggml_add(ctx, kv, w.dec_cross_kv_b);
+        }
+    }
+
     for (int il = 0; il < hp.dec_n_layers; ++il) {
         const auto & blk = w.dec_blocks[il];
 
-        ggml_tensor * Kc = ggml_mul_mat(ctx, blk.cross_k_w, db.encoder_out_in);
-        if (blk.cross_k_b != nullptr) {
-            Kc = ggml_add(ctx, Kc, blk.cross_k_b);
-        }
-        ggml_tensor * Vc = ggml_mul_mat(ctx, blk.cross_v_w, db.encoder_out_in);
-        if (blk.cross_v_b != nullptr) {
-            Vc = ggml_add(ctx, Vc, blk.cross_v_b);
+        ggml_tensor * Kc = nullptr;
+        ggml_tensor * Vc = nullptr;
+        if (kv != nullptr) {
+            const size_t off = ggml_element_size(kv) * static_cast<size_t>(2 * il) * hidden;
+            Kc               = ggml_view_3d(ctx, kv, hidden, T_enc_max, B, kv->nb[1], kv->nb[2], off);
+            Vc =
+                ggml_view_3d(ctx, kv, hidden, T_enc_max, B, kv->nb[1], kv->nb[2], off + ggml_element_size(kv) * hidden);
+        } else {
+            Kc = ggml_mul_mat(ctx, blk.cross_k_w, db.encoder_out_in);
+            if (blk.cross_k_b != nullptr) {
+                Kc = ggml_add(ctx, Kc, blk.cross_k_b);
+            }
+            Vc = ggml_mul_mat(ctx, blk.cross_v_w, db.encoder_out_in);
+            if (blk.cross_v_b != nullptr) {
+                Vc = ggml_add(ctx, Vc, blk.cross_v_b);
+            }
         }
 
         const size_t  off_k = k_elem * static_cast<size_t>(il) * T_enc_max * hidden * B;
@@ -847,11 +862,9 @@ StepBuildBatched build_step_graph_batched(ggml_context *        ctx,
         const auto & blk = w.dec_blocks[i];
         {
             ggml_tensor * xn = layer_norm(ctx, x, blk.norm1_w, blk.norm1_b);
-            ggml_tensor * so =
-                mha_self_step_batched(ctx, sb.graph, xn, kv_cache, sb.self_mask_in, sb.kv_idx_in, blk.self_q_w,
-                                      blk.self_q_b, blk.self_k_w, blk.self_k_b, blk.self_v_w, blk.self_v_b,
-                                      blk.self_o_w, blk.self_o_b, n_heads, static_cast<int>(hidden), i, max_n_kv, B);
-            x = ggml_add(ctx, x, so);
+            ggml_tensor * so = mha_self_step_batched(ctx, sb.graph, xn, kv_cache, sb.self_mask_in, sb.kv_idx_in, blk,
+                                                     n_heads, static_cast<int>(hidden), i, max_n_kv, B);
+            x                = ggml_add(ctx, x, so);
         }
         {
             ggml_tensor * xn = layer_norm(ctx, x, blk.norm2_w, blk.norm2_b);

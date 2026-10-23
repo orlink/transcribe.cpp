@@ -115,6 +115,11 @@ struct CanaryModel final : public transcribe_model {
     ggml_context *        conv_pw_f32_ctx    = nullptr;
     ggml_backend_buffer_t conv_pw_f32_buffer = nullptr;
 
+    // CPU only: the joined attention weights (stored by weight_storage) and
+    // their biases (join_bias_buffer).
+    ggml_context *        join_ctx         = nullptr;
+    ggml_backend_buffer_t join_bias_buffer = nullptr;
+
     std::optional<transcribe::MelFrontend> mel;
 
     CanaryModel() = default;

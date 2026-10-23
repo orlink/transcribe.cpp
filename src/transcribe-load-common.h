@@ -104,6 +104,20 @@ transcribe_status init_backends(transcribe_backend_request requested,
 // (`repack_buffers`): AMX on x86 CPUs with AMX, the repack types on others.
 // Those buffers keep the data in their kernels' own layout, so nothing but
 // that buffer type's ggml_mul_mat may read it.
+// Matrix weights joined at load (see allocate_weights): `joined` (2-D, no
+// storage yet, in a context of the family's own) gets the rows of `parts`
+// (ctx_meta matrix weights of its type and row length, ne1 adding up to
+// its ne1) one part after another, so one ggml_mul_mat over an input the
+// parts share computes all their outputs, each by the same dot product as
+// before. The parts themselves get no storage: nothing may use them after
+// the load.
+struct MulMatJoin {
+    ggml_tensor *              joined = nullptr;
+    std::vector<ggml_tensor *> parts;
+};
+
+using MulMatJoins = std::vector<MulMatJoin>;
+
 class WeightStorage {
   public:
     WeightStorage() = default;
@@ -135,6 +149,13 @@ class WeightStorage {
                                         const std::vector<ggml_tensor *> & tensors,
                                         const char *                       error_tag);
 
+    // True when `t` is a part of a joined weight (MulMatJoin) and so has no
+    // storage of its own.
+    bool is_dropped(const ggml_tensor * t) const noexcept;
+
+    // The joins of the load (empty without any).
+    const std::vector<MulMatJoin> & joins() const noexcept { return joins_; }
+
   private:
     friend transcribe_status allocate_weights(const std::string &                  path,
                                               const gguf_context *                 gguf_data,
@@ -143,7 +164,8 @@ class WeightStorage {
                                               const transcribe_model_load_params * params,
                                               const char *                         error_tag,
                                               WeightStorage &                      out,
-                                              const std::vector<ggml_tensor *> *   mul_mat_weights);
+                                              const std::vector<ggml_tensor *> *   mul_mat_weights,
+                                              const std::vector<MulMatJoin> *      joins);
     friend transcribe_status allocate_copied_weights(ggml_context *      ctx_meta,
                                                      const BackendPlan & plan,
                                                      const char *        error_tag,
@@ -153,6 +175,9 @@ class WeightStorage {
     ggml_backend_buffer_t              mapped_buffer_ = nullptr;
     ggml_backend_buffer_t              copy_buffer_   = nullptr;
     std::vector<ggml_backend_buffer_t> repack_buffers_;
+    ggml_backend_buffer_t              join_buffer_ = nullptr;  // joined weights outside the repack buffers
+    std::vector<MulMatJoin>            joins_;
+    std::vector<const ggml_tensor *>   dropped_;                // the parts of joins_
 };
 
 // Weights a family uses only as the first operand of ggml_mul_mat (directly
@@ -199,6 +224,12 @@ bool mmap_allowed(const transcribe_model_load_params * params);
 // buffer type supports goes into that buffer type (filled by the stream,
 // which repacks it); the rest are mapped or copied as usual.
 //
+// joins (optional, CPU primary only): see MulMatJoin. Each joined weight
+// goes into a CPU extra buffer type as a listed matrix weight would, or
+// else into an ordinary buffer; the stream fills it from its parts' file
+// bytes, and the parts get no storage. TRANSCRIBE_ERR_INVALID_ARG for a
+// join on another primary or with mismatched shapes or types.
+//
 // Returns TRANSCRIBE_OK, TRANSCRIBE_ERR_OOM when the copy buffer cannot be
 // allocated, or TRANSCRIBE_ERR_BACKEND when the device rejects a mapped
 // tensor. On error `out` may hold partial storage; the caller discards the
@@ -210,7 +241,8 @@ transcribe_status allocate_weights(const std::string &                  path,
                                    const transcribe_model_load_params * params,
                                    const char *                         error_tag,
                                    WeightStorage &                      out,
-                                   const MulMatWeights *                mul_mat_weights = nullptr);
+                                   const MulMatWeights *                mul_mat_weights = nullptr,
+                                   const MulMatJoins *                  joins           = nullptr);
 
 // Allocate every still-unallocated tensor in `ctx_meta` in an ordinary
 // buffer on plan.primary (no mapping). For loaders whose weights are not
@@ -225,6 +257,8 @@ transcribe_status allocate_copied_weights(ggml_context *      ctx_meta,
 // uploaded through ggml_backend_tensor_set in bounded (16 MiB) chunks
 // otherwise, and in one whole write for tensors `skip` reports repacked. Tensors that `skip` maps are left alone (they already hold the
 // file bytes); with skip == nullptr every tensor in ctx_meta is streamed.
+// The joined weights of `skip` (MulMatJoin) are filled from their parts'
+// bytes, and the parts are skipped.
 //
 //   path:      filesystem path to the GGUF file, reopened fresh via
 //              std::ifstream. Stable for the life of the call.
@@ -255,7 +289,8 @@ transcribe_status load_weights(const std::string &                  path,
                                const transcribe_model_load_params * params,
                                const char *                         error_tag,
                                WeightStorage &                      out,
-                               const MulMatWeights *                mul_mat_weights = nullptr);
+                               const MulMatWeights *                mul_mat_weights = nullptr,
+                               const MulMatJoins *                  joins           = nullptr);
 
 // A single F16 → F32 promotion target: `dst_slot` is a pointer into a
 // family weights struct (e.g. &block.conv_pw1_w) that currently holds

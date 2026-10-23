@@ -160,6 +160,10 @@ struct CanaryBlock {
     ggml_tensor * attn_pos_w  = nullptr;
     ggml_tensor * attn_pos_u  = nullptr;
     ggml_tensor * attn_pos_v  = nullptr;
+    // On a CPU primary, attn_q / k / v joined at load into one matrix
+    // ([d_model, 3 d_model], the parts then have no storage) and its bias.
+    ggml_tensor * attn_qkv_w  = nullptr;
+    ggml_tensor * attn_qkv_b  = nullptr;
 
     // Conv module — BN fused at load into _scale/_bias.
     ggml_tensor * norm_conv_w         = nullptr;
@@ -217,6 +221,10 @@ struct CanaryDecBlock {
     ggml_tensor * self_o_w = nullptr;
     ggml_tensor * self_o_b = nullptr;
 
+    // On a CPU primary, self_q / k / v joined at load (see CanaryBlock::attn_qkv_w).
+    ggml_tensor * self_qkv_w = nullptr;
+    ggml_tensor * self_qkv_b = nullptr;
+
     ggml_tensor * norm2_w   = nullptr;
     ggml_tensor * norm2_b   = nullptr;
     ggml_tensor * cross_q_w = nullptr;
@@ -255,6 +263,12 @@ struct CanaryWeights {
     std::vector<CanaryDecBlock> dec_blocks;
     CanaryDecFinal              dec_final;
     CanaryHead                  head;
+
+    // On a CPU primary, the cross-attention K and V of every decoder layer
+    // joined at load ([dec_d_model, 2 dec_d_model n_layers]: layer 0's K,
+    // its V, layer 1's K, ...; the parts then have no storage) and their bias.
+    ggml_tensor * dec_cross_kv_w = nullptr;
+    ggml_tensor * dec_cross_kv_b = nullptr;
 };
 
 transcribe_status build_canary_weights(ggml_context * ctx_meta, const CanaryHParams & hp, CanaryWeights & weights);
