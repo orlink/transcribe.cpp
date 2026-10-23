@@ -1,4 +1,5 @@
 #include "unary-ops.h"
+#include "vec.h"
 
 static inline float op_abs(float x) {
     return fabsf(x);
@@ -263,6 +264,21 @@ void ggml_compute_forward_relu(const ggml_compute_params * params, ggml_tensor *
 }
 
 void ggml_compute_forward_sigmoid(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        // rows through ggml_vec_sigmoid_f32, which is vectorized with the rounding of op_sigmoid
+        GGML_ASSERT(ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(dst) && ggml_are_same_shape(src0, dst));
+        GGML_TENSOR_UNARY_OP_LOCALS
+        const auto [ir0, ir1] = get_thread_range(params, src0);
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            const int64_t i03 = ir/(ne02*ne01);
+            const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+            const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+            ggml_vec_sigmoid_f32((int) ne0, (float *) ((char *) dst->data + i03*nb3 + i02*nb2 + i01*nb1),
+                                 (const float *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01));
+        }
+        return;
+    }
     unary_op<op_sigmoid>(params, dst);
 }
 

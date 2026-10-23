@@ -933,7 +933,6 @@ inline static void ggml_vec_leaky_relu_f16 (const int n, ggml_fp16_t * y, const 
         y[i] = GGML_CPU_FP32_TO_FP16(((v > 0.f) ? v : 0.f) + ns * ((v < 0.0f) ? v : 0.f));
     }
 }
-inline static void ggml_vec_sigmoid_f32 (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = 1.f / (1.f + expf(-x[i])); }
 inline static void ggml_vec_sigmoid_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {
         y[i] = GGML_CPU_FP32_TO_FP16(1.f / (1.f + expf(-GGML_CPU_FP16_TO_FP32(x[i]))));
@@ -1387,6 +1386,97 @@ inline static vfloat32m2_t ggml_v_silu_m2(vfloat32m2_t x, int vl) {
 }
 
 #endif // __ARM_NEON / __AVX2__ / __SSE2__ / __riscv_v_intrinsic
+
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+
+// expf evaluated in double and rounded once to float, by the algorithm of glibc's expf (from Arm's optimized
+// routines): x * 32 / ln 2 = k + r, exp(x) = 2^(k/32) * p(r) with 2^(k/32) from a 32-entry table and a cubic p.
+// With the same table and coefficients it returns the bits of glibc's expf (checked on all 2^32 inputs with
+// glibc 2.39), so the vector sigmoid below rounds exactly like the scalar 1 / (1 + expf(-x)).
+static const uint64_t ggml_v_expf_f64_tab[32] = {
+    0x3ff0000000000000, 0x3fefd9b0d3158574, 0x3fefb5586cf9890f, 0x3fef9301d0125b51, 0x3fef72b83c7d517b,
+    0x3fef54873168b9aa, 0x3fef387a6e756238, 0x3fef1e9df51fdee1, 0x3fef06fe0a31b715, 0x3feef1a7373aa9cb,
+    0x3feedea64c123422, 0x3feece086061892d, 0x3feebfdad5362a27, 0x3feeb42b569d4f82, 0x3feeab07dd485429,
+    0x3feea47eb03a5585, 0x3feea09e667f3bcd, 0x3fee9f75e8ec5f74, 0x3feea11473eb0187, 0x3feea589994cce13,
+    0x3feeace5422aa0db, 0x3feeb737b0cdc5e5, 0x3feec49182a3f090, 0x3feed503b23e255d, 0x3feee89f995ad3ad,
+    0x3feeff76f2fb5e47, 0x3fef199bdd85529c, 0x3fef3720dcef9069, 0x3fef5818dcfba487, 0x3fef7c97337b9b5f,
+    0x3fefa4afa2a490da, 0x3fefd0765b6e4540,
+};
+
+inline static __m512d ggml_v_expf_f64_pd(__m512d x) {
+    // glibc's FMA build fuses the product x * 32 / ln 2 into both uses; the intrinsics fix that order
+    const __m512d shift = _mm512_set1_pd(0x1.8p+52);
+    const __m512d invln = _mm512_set1_pd(0x1.71547652b82fep+5);
+    __m512d       kd    = _mm512_fmadd_pd(x, invln, shift);
+    const __m512i ki    = _mm512_castpd_si512(kd);
+    kd                  = _mm512_sub_pd(kd, shift);
+    const __m512d r     = _mm512_fmsub_pd(x, invln, kd);
+    const __m512i t0    = _mm512_permutex2var_epi64(_mm512_loadu_si512(ggml_v_expf_f64_tab), ki,
+                                                    _mm512_loadu_si512(ggml_v_expf_f64_tab + 8));
+    const __m512i t1    = _mm512_permutex2var_epi64(_mm512_loadu_si512(ggml_v_expf_f64_tab + 16), ki,
+                                                    _mm512_loadu_si512(ggml_v_expf_f64_tab + 24));
+    __m512i       t     = _mm512_mask_blend_epi64(_mm512_test_epi64_mask(ki, _mm512_set1_epi64(16)), t0, t1);
+    t                   = _mm512_add_epi64(t, _mm512_slli_epi64(ki, 47));
+    const __m512d zr    = _mm512_fmadd_pd(_mm512_set1_pd(0x1.c6af84b912394p-20), r, _mm512_set1_pd(0x1.ebfce50fac4f3p-13));
+    const __m512d r2    = _mm512_mul_pd(r, r);
+    __m512d       y     = _mm512_fmadd_pd(_mm512_set1_pd(0x1.62e42ff0c52d6p-6), r, _mm512_set1_pd(1.0));
+    y                   = _mm512_fmadd_pd(zr, r2, y);
+    return _mm512_mul_pd(y, _mm512_castsi512_pd(t));
+}
+
+inline static __m512 ggml_v_expf_f64(__m512 x) {
+    const __m256 lo  = _mm512_cvtpd_ps(ggml_v_expf_f64_pd(_mm512_cvtps_pd(_mm512_castps512_ps256(x))));
+    const __m256 hi  = _mm512_cvtpd_ps(ggml_v_expf_f64_pd(_mm512_cvtps_pd(_mm512_extractf32x8_ps(x, 1))));
+    __m512       res = _mm512_insertf32x8(_mm512_castps256_ps512(lo), hi, 1);
+    // the cases glibc handles apart: overflow to inf, underflow to +0, nan
+    res = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(x, _mm512_set1_ps(0x1.62e42ep6f), _CMP_GT_OQ), res, _mm512_set1_ps(INFINITY));
+    res = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(x, _mm512_set1_ps(-0x1.9fe368p6f), _CMP_LT_OQ), res, _mm512_setzero_ps());
+    return _mm512_mask_blend_ps(_mm512_cmp_ps_mask(x, x, _CMP_UNORD_Q), res, _mm512_add_ps(x, x));
+}
+
+// 1 / (1 + exp(-x))
+inline static __m512 ggml_v_sigmoid(__m512 x) {
+    const __m512 one = _mm512_set1_ps(1.0f);
+    return _mm512_div_ps(one, _mm512_add_ps(one, ggml_v_expf_f64(_mm512_sub_ps(_mm512_setzero_ps(), x))));
+}
+
+#endif // __AVX512F__ && __AVX512DQ__
+
+inline static void ggml_vec_sigmoid_f32(const int n, float * y, const float * x) {
+    int i = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    for (; i + 15 < n; i += 16) {
+        _mm512_storeu_ps(y + i, ggml_v_sigmoid(_mm512_loadu_ps(x + i)));
+    }
+    if (i < n) {
+        const __mmask16 m = (__mmask16) ((1u << (n - i)) - 1);
+        _mm512_mask_storeu_ps(y + i, m, ggml_v_sigmoid(_mm512_maskz_loadu_ps(m, x + i)));
+        return;
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] = 1.f / (1.f + expf(-x[i]));
+    }
+}
+
+// y = g * sigmoid(x), rounded as a sigmoid followed by a separate product
+inline static void ggml_vec_sigmoid_mul_f32(const int n, float * y, const float * x, const float * g) {
+    int i = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    for (; i + 15 < n; i += 16) {
+        _mm512_storeu_ps(y + i, _mm512_mul_ps(_mm512_loadu_ps(g + i), ggml_v_sigmoid(_mm512_loadu_ps(x + i))));
+    }
+    if (i < n) {
+        const __mmask16 m = (__mmask16) ((1u << (n - i)) - 1);
+        _mm512_mask_storeu_ps(y + i, m,
+                              _mm512_mul_ps(_mm512_maskz_loadu_ps(m, g + i), ggml_v_sigmoid(_mm512_maskz_loadu_ps(m, x + i))));
+        return;
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] = g[i] * (1.f / (1.f + expf(-x[i])));
+    }
+}
 
 inline static void ggml_vec_silu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     for (int i = 0; i < n; ++i) {

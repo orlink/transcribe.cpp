@@ -4128,6 +4128,36 @@ void ggml_compute_forward_norm_mul_add_fused(
     }
 }
 
+// SIGMOID(x) -> MUL(g, .) on f32 rows of the same shape (a gated linear unit): dst = g * sigmoid(x) in one pass,
+// with the sigmoid of ggml_vec_sigmoid_f32 and the product rounded separately, as the two nodes would.
+void ggml_compute_forward_sigmoid_mul_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst_sig,
+        ggml_tensor * dst_mul) {
+
+    const ggml_tensor * x = dst_sig->src[0];
+    const ggml_tensor * g = dst_mul->src[0] == dst_sig ? dst_mul->src[1] : dst_mul->src[0];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 && dst_mul->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && g->nb[0] == sizeof(float) && dst_mul->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(x, dst_mul) && ggml_are_same_shape(g, dst_mul));
+
+    const int64_t ne0 = dst_mul->ne[0];
+    const int64_t ne1 = dst_mul->ne[1];
+    const int64_t ne2 = dst_mul->ne[2];
+
+    const auto [ir0, ir1] = get_thread_range(params, dst_mul);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir/(ne2*ne1);
+        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
+        const int64_t i1 = ir - i3*ne2*ne1 - i2*ne1;
+        ggml_vec_sigmoid_mul_f32((int) ne0,
+                (float *) ((char *) dst_mul->data + i1*dst_mul->nb[1] + i2*dst_mul->nb[2] + i3*dst_mul->nb[3]),
+                (const float *) ((const char *) x->data + i1*x->nb[1] + i2*x->nb[2] + i3*x->nb[3]),
+                (const float *) ((const char *) g->data + i1*g->nb[1] + i2*g->nb[2] + i3*g->nb[3]));
+    }
+}
+
 void ggml_compute_forward_norm(
         const ggml_compute_params * params,
         ggml_tensor * dst) {

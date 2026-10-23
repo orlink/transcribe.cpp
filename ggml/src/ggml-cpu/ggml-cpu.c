@@ -3140,6 +3140,23 @@ static int ggml_cpu_try_fuse_ops(
         }
     }
 
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+        // SIGMOID + MUL (gated linear unit)
+        const enum ggml_op fuse_ops[] = { GGML_OP_UNARY, GGML_OP_MUL };
+        if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
+            struct ggml_tensor * mul_node = cgraph->nodes[node_n + 1];
+            const struct ggml_tensor * x = node->src[0];
+            const struct ggml_tensor * g = (mul_node->src[0] == node) ? mul_node->src[1] : mul_node->src[0];
+            if (x->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                mul_node->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && g->nb[0] == sizeof(float) &&
+                mul_node->nb[0] == sizeof(float) && ggml_are_same_shape(g, mul_node)) {
+
+                ggml_compute_forward_sigmoid_mul_fused(params, node, mul_node);
+                return 1;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
         const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };

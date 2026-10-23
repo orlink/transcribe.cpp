@@ -385,6 +385,21 @@ add_test(NAME transcribe_q8_0_grouped_unit
     COMMAND transcribe_q8_0_grouped_unit)
 
 # -----------------------------------------------------------------------------
+# CPU fusions and direct kernels that must reproduce the ops they replace bit
+# for bit (fused sigmoid gate)
+# -----------------------------------------------------------------------------
+
+add_executable(transcribe_cpu_fused_ops_unit
+    cpu_fused_ops_unit.cpp)
+
+target_link_libraries(transcribe_cpu_fused_ops_unit PRIVATE ggml)
+
+transcribe_apply_warnings(transcribe_cpu_fused_ops_unit)
+
+add_test(NAME transcribe_cpu_fused_ops_unit
+    COMMAND transcribe_cpu_fused_ops_unit)
+
+# -----------------------------------------------------------------------------
 # causal_lm::pack_gate_up: alias / copy / mismatch, no model needed
 # -----------------------------------------------------------------------------
 
