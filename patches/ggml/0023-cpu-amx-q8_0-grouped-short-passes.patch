@@ -1,0 +1,121 @@
+diff --git a/src/ggml-cpu/amx/mmq-grouped.cpp b/src/ggml-cpu/amx/mmq-grouped.cpp
+index 912b52c..1a6c6f5 100644
+--- a/src/ggml-cpu/amx/mmq-grouped.cpp
++++ b/src/ggml-cpu/amx/mmq-grouped.cpp
+@@ -229,67 +229,6 @@ void grouped_vnni_dispatch(const amx_q8_0_grouped_info & gi, const group_scales
+     }
+ }
+ 
+-// up to 16 rows: one A tile against nt (4, or 2 at the edge) weight tiles from column tile nt0. Tiles: A 3,
+-// B 0-2 (rotating), C 4-7. The C tiles accumulate over K; each group's sums are the difference of two stored
+-// running totals, and a group is scaled while the next one's tiles are computed.
+-void grouped_rows16(const amx_q8_0_grouped_info & gi, const group_scales & gs, const int8_t * RESTRICT W,
+-                    const float * RESTRICT Ws, const int8_t * RESTRICT A, const float * RESTRICT as, int M, int nt0,
+-                    int nt, float * RESTRICT C, int ldc, const float * RESTRICT bias) {
+-    const int     KS = gi.K / 64;
+-    const size_t  TS = (size_t) KS * G_TILE;
+-    const int8_t * W0 = W + nt0 * TS;
+-    alignas(64) int32_t ring[G_RING][4][TILE_M * TILE_N];
+-    alignas(64) float   acc[TILE_M][64];
+-
+-    auto consume = [&](int g) {
+-        const int gw = g * gs.R / gs.wg;
+-        const int ga = g * gs.R / gs.ag;
+-        for (int t = 0; t < nt; ++t) {
+-            const __m512    w    = _mm512_loadu_ps(Ws + ((size_t) (nt0 + t) * gs.NGw + gw) * TILE_N);
+-            const int32_t * cur  = ring[g % G_RING][t];
+-            const int32_t * prev = ring[(g + G_RING - 1) % G_RING][t];
+-            for (int r = 0; r < M; ++r) {
+-                acc_row(&acc[r][t * 16], cur + r * TILE_N, prev + r * TILE_N, w, as[(size_t) r * gs.NGa + ga], g == 0);
+-            }
+-        }
+-    };
+-
+-    _tile_zero(TMM4);
+-    _tile_zero(TMM5);
+-    _tile_zero(TMM6);
+-    _tile_zero(TMM7);
+-    for (int g = 0; g < gs.NR; ++g) {
+-        for (int s = 0; s < gs.SR; ++s) {
+-            const size_t ko = (size_t) (g * gs.SR + s) * G_TILE;
+-            _tile_loadd(TMM3, A + ko, 64);
+-            _tile_loadd(TMM0, W0 + ko, 64);
+-            _tile_dpbssd(TMM4, TMM3, TMM0);
+-            _tile_loadd(TMM1, W0 + TS + ko, 64);
+-            _tile_dpbssd(TMM5, TMM3, TMM1);
+-            if (nt == 4) {
+-                _tile_loadd(TMM2, W0 + 2 * TS + ko, 64);
+-                _tile_dpbssd(TMM6, TMM3, TMM2);
+-                _tile_loadd(TMM0, W0 + 3 * TS + ko, 64);
+-                _tile_dpbssd(TMM7, TMM3, TMM0);
+-            }
+-        }
+-        int32_t(*cur)[TILE_M * TILE_N] = ring[g % G_RING];
+-        _tile_stored(TMM4, cur[0], 64);
+-        _tile_stored(TMM5, cur[1], 64);
+-        if (nt == 4) {
+-            _tile_stored(TMM6, cur[2], 64);
+-            _tile_stored(TMM7, cur[3], 64);
+-        }
+-        if (g > 0) {
+-            consume(g - 1);
+-        }
+-    }
+-    consume(gs.NR - 1);
+-    for (int r = 0; r < M; ++r) {
+-        write_row(C + (size_t) r * ldc, acc[r], bias, nt);
+-    }
+-}
+-
+ // one 32-column panel (column tiles 2 nb, 2 nb + 1) for all rows, two 16-row A tiles at a time. Tiles: B 0-1,
+ // A 2-3, C 4 / 6 (first A tile x B 0 / 1) and 5 / 7 (second A tile).
+ void grouped_panel(const amx_q8_0_grouped_info & gi, const group_scales & gs, const int8_t * RESTRICT W,
+@@ -477,16 +416,19 @@ void amx_q8_0_grouped_mul_mat(const struct ggml_compute_params * params, const a
+     int8_t *           A    = (int8_t *) params->wdata;
+     float *            as   = (float *) (A + (size_t) MT * TILE_M * K);
+     const float *      x    = (const float *) src1->data;
+-    const bool         rows16 = M <= TILE_M;
+-    // passes of up to GGML_AMX_GROUPED_VNNI_ROWS rows (default AMX_GROUPED_VNNI_ROWS, at most that) on VNNI
+-    static const int   vnni_rows = [] {
++    // Passes of one row, and of up to four rows on four or more threads, run on VNNI (it streams the weights
++    // faster); longer ones on the 32-column panels, which for 2 to 16 rows are faster than VNNI on fewer
++    // threads and than one A tile against four weight tiles. GGML_AMX_GROUPED_VNNI_ROWS (0 to
++    // AMX_GROUPED_VNNI_ROWS) overrides the limit. Every path gives the same results.
++    static const int   vnni_rows_env = [] {
+         const char * v = getenv("GGML_AMX_GROUPED_VNNI_ROWS");
+-        return std::clamp(v != nullptr ? atoi(v) : AMX_GROUPED_VNNI_ROWS, 0, AMX_GROUPED_VNNI_ROWS);
++        return v != nullptr ? std::clamp(atoi(v), 0, AMX_GROUPED_VNNI_ROWS) : -1;
+     }();
+-    const bool vnni = M <= vnni_rows;
++    const int  vnni_rows = vnni_rows_env >= 0 ? vnni_rows_env : params->nth >= 4 ? 4 : 1;
++    const bool vnni      = M <= vnni_rows;
+ 
+-    // short passes stream the weights from memory: hand their column blocks out dynamically
+-    if (rows16 && params->ith == 0) {
++    // VNNI passes stream the weights from memory: hand their column blocks out dynamically
++    if (vnni && params->ith == 0) {
+         ggml_threadpool_chunk_set(params->threadpool, params->nth);
+     }
+     if (vnni) {
+@@ -525,21 +467,6 @@ void amx_q8_0_grouped_mul_mat(const struct ggml_compute_params * params, const a
+         }
+         return;
+     }
+-    if (rows16) {
+-        const int NT = N / TILE_N;
+-        const int NB = (NT + 3) / 4;
+-        bool      configured = false;
+-        for (int i = params->ith; i < NB; i = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+-            if (!configured) {
+-                grouped_tile_config();
+-                configured = true;
+-            }
+-            const int nt = std::min(4, NT - 4 * i);
+-            grouped_rows16(gi, gs, W, Ws, A, as, (int) M, 4 * i, nt, out_data + (size_t) i * 64, N,
+-                           bias != nullptr ? bias + (size_t) i * 64 : nullptr);
+-        }
+-        return;
+-    }
+     parallel_for_ggml(params, N / (2 * TILE_N), [&](int begin, int end) {
+         if (begin < end) {
+             grouped_tile_config();
