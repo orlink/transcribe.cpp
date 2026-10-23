@@ -22,6 +22,7 @@ patches:
   patches/ggml/0019-cpu-faster-pre-encode-kernels.patch
   patches/ggml/0020-cpu-rel-pos-scores-packed-rows.patch
   patches/ggml/0021-cpu-vector-f16-cast-rows.patch
+  patches/ggml/0022-cpu-amx-fp16-rel-pos-attention.patch
 
 This directory is generated from the upstream ggml tree at the SHA above, minus
 .github/, with the listed downstream patches applied in order. Do not edit it by

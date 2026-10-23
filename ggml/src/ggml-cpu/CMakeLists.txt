@@ -43,6 +43,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/amx/mmq.h
         ggml-cpu/amx/mmq-grouped.cpp
         ggml-cpu/amx/mmq-grouped.h
+        ggml-cpu/amx/fa.cpp
+        ggml-cpu/amx/fa.h
         ggml-cpu/tiled/tiled.cpp
         ggml-cpu/tiled/tiled.h
         ggml-cpu/tiled/tiled-kernel.cpp

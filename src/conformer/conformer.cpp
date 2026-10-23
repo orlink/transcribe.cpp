@@ -890,6 +890,31 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
     const size_t     mask_f32_bytes  = static_cast<size_t>(pos_len) * T_q * n_head * B * sizeof(float);
     const bool       split_flash_mask =
         flash && !is_local && !is_chunked && params.attn_pad_mask == nullptr && mask_f32_bytes > kSplitMaskBytes;
+    // Opt-in on CPU: the whole attention, position scores included, in one AMX-FP16 kernel.
+    if (flash && params.policy.cpu_fa_fp16 && !split_flash_mask && !is_local && !is_chunked &&
+        params.attn_pad_mask == nullptr && B == 1 && T_kv == T_q) {
+        using Getter           = ggml_custom_op_t (*)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
+                                                      const ggml_tensor *, const ggml_tensor *);
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+        const Getter       get = reg != nullptr ? reinterpret_cast<Getter>(ggml_backend_reg_get_proc_address(
+                                                      reg, "ggml_backend_cpu_rel_pos_attn_amx_op")) :
+                                                  nullptr;
+        ggml_custom_op_t   op  = get != nullptr ? get(q_u, k, v, q_v_perm, p_perm) : nullptr;
+        if (op != nullptr) {
+            uint32_t scale_bits = 0;
+            std::memcpy(&scale_bits, &scale, sizeof(scale_bits));
+            ggml_tensor * args[5] = { q_u, k, v, q_v_perm, p_perm };
+            ggml_tensor * o =
+                ggml_custom_4d(ctx, GGML_TYPE_F32, head_dim, n_head, T_q, 1, args, 5, op, GGML_N_TASKS_MAX,
+                               reinterpret_cast<void *>(static_cast<uintptr_t>(scale_bits)));
+            o = ggml_reshape_3d(ctx, o, d_model, T_q, B);
+            o = ggml_mul_mat(ctx, b.attn_out_w, o);
+            if (b.attn_out_b != nullptr) {
+                o = ggml_add(ctx, o, b.attn_out_b);
+            }
+            return o;
+        }
+    }
     ggml_tensor * matrix_bd = nullptr;
     // On CPU, the scaled f16 flash mask straight from q_v and p in one kernel (only the T_kv x T_q scores kept).
     bool          bd_fused  = false;

@@ -1,0 +1,394 @@
+// Conformer self-attention with relative positions on AMX-FP16 tiles (TDPFP16PS), see fa.h.
+//
+// The tasks are one head and 16 queries each, shared out among the threads in order, so a thread works on one or a
+// few heads. For each head it takes, a thread first repacks into its own buffers, rounded to f16, the pair layouts
+// the tile products read (16 x 16 blocks of pairs transposed in registers):
+//   keys       kp[p][j]       = (K[j][2p], K[j][2p + 1])        D / 2 x keys, padded to 64 by zeros
+//   positions  pp[p][16 + r]  = (P[r][2p], P[r][2p + 1])        D / 2 x (16 zero columns, 2T - 1 positions, zeros)
+//   values     vp[jp][d][2]   = (V[2jp][d], V[2jp + 1][d])      keys / 2 x D pairs
+// Then for each block of 64 keys j0 .. j0 + 63 and queries i0 .. i0 + 15:
+//   content    S  (16 x 64) = Qu . K^T
+//   position   Sp (16 x 80) = Qv . P^T over the 80 positions from T - 16 - i0 + j0; query i0 + n and key j0 + c
+//              take position column 15 - n + c
+//   softmax    online, in f32, one row at a time, of scale * (S + Sp), keys past the end left out
+//   values     O (16 x D) += W . V, the weights W rounded to f16, O in f32
+
+#include "fa.h"
+
+#include "common.h"
+#include "ggml-cpu-impl.h"
+#include "ggml-impl.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+#if defined(__AMX_TILE__) && defined(__AMX_FP16__) && defined(__AVX512F__) && defined(__AVX512BW__) && \
+    defined(__linux__)
+#define GGML_FA_AMX_KERNEL 1
+#include <immintrin.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+namespace {
+
+#if defined(GGML_FA_AMX_KERNEL)
+
+constexpr int64_t k_rows  = 16;  // queries per task
+constexpr int64_t k_block = 64;  // keys per step
+constexpr int64_t k_ppad  = 16;  // zero position columns before the first position
+
+bool amx_permission() {
+    // ARCH_REQ_XCOMP_PERM (0x1023) for XFEATURE_XTILEDATA (18)
+    static const bool ok = syscall(SYS_arch_prctl, 0x1023, 18) == 0;
+    return ok;
+}
+
+// all tiles 16 rows x 64 bytes (their use in attn_task)
+void tile_config() {
+    if (ggml_amx_tile_config_id == AMX_TILE_CONFIG_FA) {
+        return;
+    }
+    alignas(64) tile_config_t tc = {};
+    tc.palette_id                = 1;
+    for (int t = 0; t < 8; ++t) {
+        tc.rows[t]  = 16;
+        tc.colsb[t] = 64;
+    }
+    _tile_loadconfig(&tc);
+    ggml_amx_tile_config_id = AMX_TILE_CONFIG_FA;
+}
+
+// GCC's _tile_loadd / _tile_stored have no memory clobber: keep the AVX-512 stores and the tile loads in order
+#define FA_AMX_MEMORY_BARRIER() __asm__ __volatile__("" ::: "memory")
+
+inline __m256i to_f16(__m512 x) {
+    return _mm512_cvtps_ph(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+}
+
+// exp of 16 floats: 2^k * p(r), r = x - k ln2, |r| <= ln2 / 2, degree-6 polynomial (relative error about 2e-7)
+inline __m512 exp16(__m512 x) {
+    x              = _mm512_max_ps(x, _mm512_set1_ps(-100.0f));
+    x              = _mm512_min_ps(x, _mm512_set1_ps(88.0f));
+    const __m512 k = _mm512_roundscale_ps(_mm512_mul_ps(x, _mm512_set1_ps(1.44269504f)), _MM_FROUND_TO_NEAREST_INT);
+    __m512       r = _mm512_fnmadd_ps(k, _mm512_set1_ps(0.693145751953125f), x);
+    r              = _mm512_fnmadd_ps(k, _mm512_set1_ps(1.428606765330187e-06f), r);
+    __m512 p       = _mm512_set1_ps(1.0f / 720);
+    p              = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f / 120));
+    p              = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f / 24));
+    p              = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f / 6));
+    p              = _mm512_fmadd_ps(p, r, _mm512_set1_ps(0.5f));
+    p              = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+    p              = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+    return _mm512_scalef_ps(p, k);
+}
+
+// transpose of a 16 x 16 block of 32-bit values: r[i] holds row i on entry and column i on return
+inline void transpose16(__m512i * r) {
+    __m512i t[16];
+    for (int i = 0; i < 8; ++i) {
+        t[2 * i]     = _mm512_unpacklo_epi32(r[2 * i], r[2 * i + 1]);
+        t[2 * i + 1] = _mm512_unpackhi_epi32(r[2 * i], r[2 * i + 1]);
+    }
+    // s[4i + c], 128-bit lane L: column 4L + c of rows 4i .. 4i + 3
+    __m512i u[16];
+    for (int i = 0; i < 4; ++i) {
+        u[4 * i + 0] = _mm512_unpacklo_epi64(t[4 * i + 0], t[4 * i + 2]);
+        u[4 * i + 1] = _mm512_unpackhi_epi64(t[4 * i + 0], t[4 * i + 2]);
+        u[4 * i + 2] = _mm512_unpacklo_epi64(t[4 * i + 1], t[4 * i + 3]);
+        u[4 * i + 3] = _mm512_unpackhi_epi64(t[4 * i + 1], t[4 * i + 3]);
+    }
+    for (int c = 0; c < 4; ++c) {
+        const __m512i v0 = _mm512_shuffle_i32x4(u[c], u[4 + c], 0x44);
+        const __m512i v1 = _mm512_shuffle_i32x4(u[c], u[4 + c], 0xee);
+        const __m512i w0 = _mm512_shuffle_i32x4(u[8 + c], u[12 + c], 0x44);
+        const __m512i w1 = _mm512_shuffle_i32x4(u[8 + c], u[12 + c], 0xee);
+        r[0 + c]         = _mm512_shuffle_i32x4(v0, w0, 0x88);
+        r[4 + c]         = _mm512_shuffle_i32x4(v0, w0, 0xdd);
+        r[8 + c]         = _mm512_shuffle_i32x4(v1, w1, 0x88);
+        r[12 + c]        = _mm512_shuffle_i32x4(v1, w1, 0xdd);
+    }
+}
+
+// rows r0 .. r0 + n - 1 (n a multiple of 16) of x (f32, row r at base + r * stride) rounded to f16 pairs into
+// dst[p * ld + r - r0]; rows outside 0 .. n_valid - 1 give zeros
+void pack_pairs(const char * base, size_t stride, int64_t r0, int64_t n, int64_t n_valid, int64_t D, uint32_t * dst,
+                int64_t ld) {
+    for (int64_t rb = r0; rb < r0 + n; rb += 16) {
+        for (int64_t pb = 0; pb < D / 2; pb += 16) {
+            __m512i r[16];
+            for (int i = 0; i < 16; ++i) {
+                const int64_t row = rb + i;
+                if (row >= 0 && row < n_valid) {
+                    const float * x = (const float *) (base + row * stride) + 2 * pb;
+                    r[i] = _mm512_inserti64x4(_mm512_castsi256_si512(to_f16(_mm512_loadu_ps(x))),
+                                              to_f16(_mm512_loadu_ps(x + 16)), 1);
+                } else {
+                    r[i] = _mm512_setzero_si512();
+                }
+            }
+            transpose16(r);
+            for (int q = 0; q < 16; ++q) {
+                _mm512_storeu_si512((void *) (dst + (pb + q) * ld + (rb - r0)), r[q]);
+            }
+        }
+    }
+}
+
+struct head_pack {
+    std::vector<uint32_t> kp, pp;
+    std::vector<uint16_t> vp;
+    int64_t               h = -1;
+};
+
+void pack_head(const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * p, int64_t h, int64_t T,
+               int64_t Tpad, int64_t Ppad, head_pack & hp) {
+    const int64_t D = k->ne[0];
+    hp.kp.resize(D / 2 * Tpad);
+    hp.pp.resize(D / 2 * Ppad);
+    hp.vp.resize(Tpad * D);
+    pack_pairs((const char *) k->data + h * k->nb[2], k->nb[1], 0, Tpad, T, D, hp.kp.data(), Tpad);
+    pack_pairs((const char *) p->data + h * p->nb[2], p->nb[1], -k_ppad, Ppad, 2 * T - 1, D, hp.pp.data(), Ppad);
+    const __m512 zero = _mm512_setzero_ps();
+    for (int64_t j = 0; j < Tpad; j += 2) {
+        const float * r0  = (const float *) ((const char *) v->data + j * v->nb[1] + h * v->nb[2]);
+        const float * r1  = (const float *) ((const char *) r0 + v->nb[1]);
+        uint16_t *    dst = hp.vp.data() + j * D;
+        for (int64_t d = 0; d < D; d += 16) {
+            const __m256i a  = to_f16(j < T ? _mm512_loadu_ps(r0 + d) : zero);
+            const __m256i b  = to_f16(j + 1 < T ? _mm512_loadu_ps(r1 + d) : zero);
+            const __m256i lo = _mm256_unpacklo_epi16(a, b), hi = _mm256_unpackhi_epi16(a, b);
+            _mm256_storeu_si256((__m256i *) (dst + 2 * d), _mm256_permute2x128_si256(lo, hi, 0x20));
+            _mm256_storeu_si256((__m256i *) (dst + 2 * d + 16), _mm256_permute2x128_si256(lo, hi, 0x31));
+        }
+    }
+    hp.h = h;
+}
+
+struct task_scratch {
+    std::vector<uint16_t> qu, qv, w;  // 16 x D, 16 x D, 16 x 64 (f16)
+    std::vector<float>    o, s, sp;   // 16 x D, 16 x 64, 16 x 80
+};
+
+// queries i0 .. i0 + 15 of head h
+void attn_task(const ggml_tensor * q_u, const ggml_tensor * q_v, ggml_tensor * dst, const head_pack & hp, int64_t h,
+               int64_t i0, int64_t T, int64_t Tpad, int64_t Ppad, float scale, task_scratch & ts) {
+    constexpr int64_t NP = k_block + 16;  // position columns per step
+    const int64_t     D  = q_u->ne[0];
+    const int         nr = (int) std::min<int64_t>(k_rows, T - i0);
+    ts.qu.resize(k_rows * D);
+    ts.qv.resize(k_rows * D);
+    ts.w.assign(k_rows * k_block, 0);
+    ts.o.assign(k_rows * D, 0.0f);
+    ts.s.resize(k_rows * k_block);
+    ts.sp.resize(k_rows * NP);
+    uint16_t * qu = ts.qu.data();
+    uint16_t * qv = ts.qv.data();
+    uint16_t * w  = ts.w.data();
+    float *    o  = ts.o.data();
+    float *    s  = ts.s.data();
+    float *    sp = ts.sp.data();
+    for (int n = 0; n < k_rows; ++n) {
+        if (n >= nr) {
+            memset(qu + n * D, 0, D * sizeof(uint16_t));
+            memset(qv + n * D, 0, D * sizeof(uint16_t));
+            continue;
+        }
+        const float * xu = (const float *) ((const char *) q_u->data + (i0 + n) * q_u->nb[1] + h * q_u->nb[2]);
+        const float * xv = (const float *) ((const char *) q_v->data + (i0 + n) * q_v->nb[1] + h * q_v->nb[2]);
+        for (int64_t d = 0; d < D; d += 16) {
+            _mm256_storeu_si256((__m256i *) (qu + n * D + d), to_f16(_mm512_loadu_ps(xu + d)));
+            _mm256_storeu_si256((__m256i *) (qv + n * D + d), to_f16(_mm512_loadu_ps(xv + d)));
+        }
+    }
+    float m[k_rows], l[k_rows];
+    for (int n = 0; n < k_rows; ++n) {
+        m[n] = -INFINITY;
+        l[n] = 0.0f;
+    }
+
+    const uint32_t * kp   = hp.kp.data();
+    const uint32_t * pp   = hp.pp.data();
+    const uint16_t * vp   = hp.vp.data();
+    const __m512     sv   = _mm512_set1_ps(scale);
+    const __m512     ninf = _mm512_set1_ps(-INFINITY);
+    for (int64_t j0 = 0; j0 < Tpad; j0 += k_block) {
+        // content scores: tiles 0-3, queries in tile 4, keys in tile 5
+        FA_AMX_MEMORY_BARRIER();
+        _tile_zero(0);
+        _tile_zero(1);
+        _tile_zero(2);
+        _tile_zero(3);
+        for (int64_t c = 0; c < D / 32; ++c) {
+            const uint32_t * kc = kp + 16 * c * Tpad + j0;
+            _tile_loadd(4, qu + 32 * c, D * sizeof(uint16_t));
+            _tile_loadd(5, kc, Tpad * sizeof(uint32_t));
+            _tile_dpfp16ps(0, 4, 5);
+            _tile_loadd(5, kc + 16, Tpad * sizeof(uint32_t));
+            _tile_dpfp16ps(1, 4, 5);
+            _tile_loadd(5, kc + 32, Tpad * sizeof(uint32_t));
+            _tile_dpfp16ps(2, 4, 5);
+            _tile_loadd(5, kc + 48, Tpad * sizeof(uint32_t));
+            _tile_dpfp16ps(3, 4, 5);
+        }
+        _tile_stored(0, s, k_block * sizeof(float));
+        _tile_stored(1, s + 16, k_block * sizeof(float));
+        _tile_stored(2, s + 32, k_block * sizeof(float));
+        _tile_stored(3, s + 48, k_block * sizeof(float));
+        // position scores: tiles 0-4 over the positions from T - 16 - i0 + j0 (after the k_ppad zero columns),
+        // queries in tile 5, positions in tile 6
+        const int64_t pb = T - 16 - i0 + j0 + k_ppad;
+        _tile_zero(0);
+        _tile_zero(1);
+        _tile_zero(2);
+        _tile_zero(3);
+        _tile_zero(4);
+        for (int64_t c = 0; c < D / 32; ++c) {
+            const uint32_t * pc = pp + 16 * c * Ppad + pb;
+            _tile_loadd(5, qv + 32 * c, D * sizeof(uint16_t));
+            _tile_loadd(6, pc, Ppad * sizeof(uint32_t));
+            _tile_dpfp16ps(0, 5, 6);
+            _tile_loadd(6, pc + 16, Ppad * sizeof(uint32_t));
+            _tile_dpfp16ps(1, 5, 6);
+            _tile_loadd(6, pc + 32, Ppad * sizeof(uint32_t));
+            _tile_dpfp16ps(2, 5, 6);
+            _tile_loadd(6, pc + 48, Ppad * sizeof(uint32_t));
+            _tile_dpfp16ps(3, 5, 6);
+            _tile_loadd(6, pc + 64, Ppad * sizeof(uint32_t));
+            _tile_dpfp16ps(4, 5, 6);
+        }
+        _tile_stored(0, sp, NP * sizeof(float));
+        _tile_stored(1, sp + 16, NP * sizeof(float));
+        _tile_stored(2, sp + 32, NP * sizeof(float));
+        _tile_stored(3, sp + 48, NP * sizeof(float));
+        _tile_stored(4, sp + 64, NP * sizeof(float));
+        FA_AMX_MEMORY_BARRIER();
+
+        // online softmax, one row at a time; query i0 + n and key j0 + c take position column 15 - n + c
+        const int64_t nk = std::min<int64_t>(k_block, T - j0);
+        __mmask16     km[4];
+        for (int g = 0; g < 4; ++g) {
+            const int64_t v = std::min<int64_t>(16, std::max<int64_t>(0, nk - 16 * g));
+            km[g]           = (__mmask16) (v == 16 ? 0xFFFF : (1u << v) - 1);
+        }
+        for (int n = 0; n < nr; ++n) {
+            const float * spn = sp + n * NP + 15 - n;
+            __m512        x[4];
+            for (int g = 0; g < 4; ++g) {
+                x[g] = _mm512_mul_ps(_mm512_add_ps(_mm512_loadu_ps(s + n * k_block + 16 * g), _mm512_loadu_ps(spn + 16 * g)),
+                                     sv);
+                x[g] = _mm512_mask_blend_ps(km[g], ninf, x[g]);
+            }
+            const float mnew =
+                std::max(m[n], _mm512_reduce_max_ps(_mm512_max_ps(_mm512_max_ps(x[0], x[1]), _mm512_max_ps(x[2], x[3]))));
+            const __m512 mv = _mm512_set1_ps(mnew);
+            __m512       pv[4];
+            for (int g = 0; g < 4; ++g) {
+                pv[g] = _mm512_maskz_mov_ps(km[g], exp16(_mm512_sub_ps(x[g], mv)));
+            }
+            if (mnew != m[n]) {
+                const float  corr = m[n] == -INFINITY ? 0.0f : expf(m[n] - mnew);
+                const __m512 cv   = _mm512_set1_ps(corr);
+                l[n] *= corr;
+                for (int64_t d = 0; d < D; d += 16) {
+                    _mm512_storeu_ps(o + n * D + d, _mm512_mul_ps(_mm512_loadu_ps(o + n * D + d), cv));
+                }
+                m[n] = mnew;
+            }
+            l[n] += _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(pv[0], pv[1]), _mm512_add_ps(pv[2], pv[3])));
+            for (int g = 0; g < 4; ++g) {
+                _mm256_storeu_si256((__m256i *) (w + n * k_block + 16 * g), to_f16(pv[g]));
+            }
+        }
+
+        // O += W . V: weights of keys 0-31 in tile 1, 32-63 in tile 2, output in tile 0, values in tiles 3 and 4
+        FA_AMX_MEMORY_BARRIER();
+        _tile_loadd(1, w, k_block * sizeof(uint16_t));
+        _tile_loadd(2, w + 32, k_block * sizeof(uint16_t));
+        for (int64_t c = 0; c < D / 16; ++c) {
+            _tile_loadd(0, o + 16 * c, D * sizeof(float));
+            _tile_loadd(3, vp + (j0 / 2 * D + 16 * c) * 2, D * 2 * sizeof(uint16_t));
+            _tile_dpfp16ps(0, 1, 3);
+            _tile_loadd(4, vp + ((j0 / 2 + 16) * D + 16 * c) * 2, D * 2 * sizeof(uint16_t));
+            _tile_dpfp16ps(0, 2, 4);
+            _tile_stored(0, o + 16 * c, D * sizeof(float));
+        }
+        FA_AMX_MEMORY_BARRIER();
+    }
+
+    for (int n = 0; n < nr; ++n) {
+        float *      out = (float *) ((char *) dst->data + (i0 + n) * dst->nb[2] + h * dst->nb[1]);
+        const __m512 inv = _mm512_set1_ps(l[n] > 0.0f ? 1.0f / l[n] : 0.0f);
+        for (int64_t d = 0; d < D; d += 16) {
+            _mm512_storeu_ps(out + d, _mm512_mul_ps(_mm512_loadu_ps(o + n * D + d), inv));
+        }
+    }
+}
+
+void rel_pos_attn_amx(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const ggml_tensor * q_u = dst->src[0];
+    const ggml_tensor * k   = dst->src[1];
+    const ggml_tensor * v   = dst->src[2];
+    const ggml_tensor * q_v = dst->src[3];
+    const ggml_tensor * p   = dst->src[4];
+    float               scale;
+    const uint32_t      bits = (uint32_t) (uintptr_t) userdata;
+    memcpy(&scale, &bits, sizeof(float));
+
+    const int64_t T     = q_u->ne[1];
+    const int64_t H     = q_u->ne[2];
+    const int64_t Tpad  = (T + k_block - 1) / k_block * k_block;
+    // position columns read: up to pb + 79 = k_ppad + T + j0 + 63 - i0 <= k_ppad + T + Tpad - 1
+    const int64_t Ppad  = (k_ppad + T + Tpad + 15) / 16 * 16;
+    const int64_t tiles = (T + k_rows - 1) / k_rows;
+    const int64_t items = H * tiles;
+    const int64_t it0   = items * ith / nth;
+    const int64_t it1   = items * (ith + 1) / nth;
+
+    static thread_local head_pack    hp;
+    static thread_local task_scratch ts;
+    hp.h = -1;
+    tile_config();
+    for (int64_t it = it0; it < it1; ++it) {
+        const int64_t h = it / tiles;
+        if (h != hp.h) {
+            pack_head(k, v, p, h, T, Tpad, Ppad, hp);
+        }
+        attn_task(q_u, q_v, dst, hp, h, (it % tiles) * k_rows, T, Tpad, Ppad, scale, ts);
+    }
+}
+
+bool rows_f32(const ggml_tensor * t, int64_t D, int64_t T, int64_t H) {
+    return t != nullptr && t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->ne[0] == D && t->ne[1] == T &&
+           t->ne[2] == H && t->ne[3] == 1;
+}
+
+#endif  // GGML_FA_AMX_KERNEL
+
+}  // namespace
+
+extern "C" ggml_custom_op_t ggml_cpu_rel_pos_attn_amx_op(const struct ggml_tensor * q_u, const struct ggml_tensor * k,
+                                                         const struct ggml_tensor * v, const struct ggml_tensor * q_v,
+                                                         const struct ggml_tensor * p) {
+#if defined(GGML_FA_AMX_KERNEL)
+    if (q_u == nullptr) {
+        return nullptr;
+    }
+    const int64_t D = q_u->ne[0], T = q_u->ne[1], H = q_u->ne[2];
+    if (D % 32 != 0 || D > 512 || T < 1 || !rows_f32(q_u, D, T, H) || !rows_f32(k, D, T, H) || !rows_f32(v, D, T, H) ||
+        !rows_f32(q_v, D, T, H) || !rows_f32(p, D, 2 * T - 1, H)) {
+        return nullptr;
+    }
+    return amx_permission() ? rel_pos_attn_amx : nullptr;
+#else
+    GGML_UNUSED(q_u);
+    GGML_UNUSED(k);
+    GGML_UNUSED(v);
+    GGML_UNUSED(q_v);
+    GGML_UNUSED(p);
+    return nullptr;
+#endif
+}

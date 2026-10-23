@@ -111,9 +111,9 @@ struct tile_config_t{
     uint8_t rows[16] = {0};
 };
 
-// the tile configuration this thread has loaded: the kernels of mmq.cpp and those of mmq-grouped.cpp use
-// different ones, so each loads its own when the other's is active
-enum { AMX_TILE_CONFIG_NONE = 0, AMX_TILE_CONFIG_Q = 1, AMX_TILE_CONFIG_GROUPED = 2 };
+// the tile configuration this thread has loaded: the kernels of mmq.cpp, mmq-grouped.cpp and fa.cpp use
+// different ones, so each loads its own when another's is active
+enum { AMX_TILE_CONFIG_NONE = 0, AMX_TILE_CONFIG_Q = 1, AMX_TILE_CONFIG_GROUPED = 2, AMX_TILE_CONFIG_FA = 3 };
 inline thread_local int ggml_amx_tile_config_id = AMX_TILE_CONFIG_NONE;
 
 // quantized types that have AMX support

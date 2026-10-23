@@ -5,6 +5,7 @@
 #include "traits.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
+#include "amx/fa.h"
 #include "fused-ops.h"
 
 #include <cctype>
@@ -725,6 +726,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_rel_pos_scores_f16_op") == 0) {
         return (void *)ggml_cpu_rel_pos_scores_f16_op;
+    }
+    if (strcmp(name, "ggml_backend_cpu_rel_pos_attn_amx_op") == 0) {
+        return (void *)ggml_cpu_rel_pos_attn_amx_op;
     }
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
     if (strcmp(name, "ggml_backend_cpu_amx_set_q8_0_grouped") == 0) {

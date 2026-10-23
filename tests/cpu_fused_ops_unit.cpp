@@ -538,6 +538,88 @@ void test_cast_f16(ggml_backend_t cpu) {
     CHECK(bad == 0);
 }
 
+// relative-position attention on AMX-FP16 tiles (an opt-in that rounds its inputs to f16) against the exact chain
+// it replaces: the position-score mask, the f16 casts of K and V and ggml_flash_attn_ext; relative L2 error of the
+// outputs, with three and four threads
+void test_rel_pos_attn_amx(ggml_backend_t cpu) {
+    using Get5             = ggml_custom_op_t (*)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
+                                                  const ggml_tensor *, const ggml_tensor *);
+    using Get2             = ggml_custom_op_t (*)(const ggml_tensor *, const ggml_tensor *);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu));
+    const Get5         get =
+        reinterpret_cast<Get5>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_rel_pos_attn_amx_op"));
+    const Get2 get_bd =
+        reinterpret_cast<Get2>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_rel_pos_scores_f16_op"));
+    if (get == nullptr || get_bd == nullptr) {
+        std::printf("rel_pos_attn_amx: no kernel, skipped\n");
+        return;
+    }
+    std::mt19937                    rng(41);
+    std::normal_distribution<float> nd(0.0f, 1.5f);
+    const float                     scale = 1.0f / std::sqrt(128.0f);
+    uint32_t                        bits  = 0;
+    std::memcpy(&bits, &scale, sizeof(bits));
+    for (const int n_threads : { 4, 3 }) {
+        ggml_backend_cpu_set_n_threads(cpu, n_threads);
+        for (const int64_t T : { 1, 7, 37, 64, 70, 133 }) {
+            const int64_t      D = 128, H = 4, P = 2 * T - 1;
+            std::vector<Input> in;
+            for (int i = 0; i < 5; ++i) {
+                Input x;
+                x.ne = { D, H, i == 4 ? P : T };
+                x.data.resize(D * H * x.ne[2]);
+                for (float & v : x.data) {
+                    v = nd(rng);
+                }
+                in.push_back(x);
+            }
+            std::vector<float> res[2];
+            ggml_custom_op_t   op = nullptr;
+            for (int amx = 0; amx < 2; ++amx) {
+                res[amx] = run_graph(cpu, in, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+                    // q_u, k, v, q_v as the attention has them before its permutes: [D, H, T]; p [D, H, P]
+                    ggml_tensor * v[5];
+                    for (int i = 0; i < 5; ++i) {
+                        v[i] = ggml_permute(ctx, t[i], 0, 2, 1, 3);
+                    }
+                    if (amx) {
+                        op = get(v[0], v[1], v[2], v[3], v[4]);
+                        if (op == nullptr) {
+                            return ggml_cont(ctx, t[0]);
+                        }
+                        return ggml_custom_4d(ctx, GGML_TYPE_F32, D, H, T, 1, v, 5, op, GGML_N_TASKS_MAX,
+                                              reinterpret_cast<void *>(static_cast<uintptr_t>(bits)));
+                    }
+                    ggml_tensor * args[2] = { v[3], v[4] };
+                    ggml_tensor * m =
+                        ggml_custom_4d(ctx, GGML_TYPE_F16, T, T, H, 1, args, 2, get_bd(v[3], v[4]), GGML_N_TASKS_MAX,
+                                       reinterpret_cast<void *>(static_cast<uintptr_t>(bits)));
+                    return ggml_flash_attn_ext(ctx, v[0], ggml_cast(ctx, v[1], GGML_TYPE_F16),
+                                               ggml_cast(ctx, v[2], GGML_TYPE_F16), m, scale, 0.0f, 0.0f);
+                });
+            }
+            if (op == nullptr) {
+                std::printf("rel_pos_attn_amx: not available (AMX-FP16), skipped\n");
+                ggml_backend_cpu_set_n_threads(cpu, 4);
+                return;
+            }
+            double se = 0.0, so = 0.0;
+            for (size_t i = 0; i < res[0].size(); ++i) {
+                const double d = res[0][i] - res[1][i];
+                se += d * d;
+                so += (double) res[0][i] * res[0][i];
+            }
+            const double rel = std::sqrt(se / so);
+            if (!(rel < 2e-3)) {
+                std::fprintf(stderr, "rel_pos_attn_amx T=%lld threads=%d: relative error %g\n", (long long) T,
+                             n_threads, rel);
+            }
+            CHECK(res[0].size() == res[1].size() && rel < 2e-3);
+        }
+    }
+    ggml_backend_cpu_set_n_threads(cpu, 4);
+}
+
 // ggml_argmax against its scalar definition (the last index of the running maximum), with ties, zeros of both
 // signs, all -inf, and a NaN
 void test_argmax(ggml_backend_t cpu) {
@@ -619,6 +701,7 @@ int main() {
     test_norm_mul_add(cpu);
     test_rel_pos_scores(cpu);
     test_cast_f16(cpu);
+    test_rel_pos_attn_amx(cpu);
     test_argmax(cpu);
 
     ggml_backend_free(cpu);

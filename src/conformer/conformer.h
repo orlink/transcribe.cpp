@@ -134,6 +134,10 @@ struct ConvPolicy {
     // which give the same results as the ops they replace: the pre_encode convs, the conv module from the
     // depthwise conv to SiLU, and the relative-position scores of flash attention.
     bool cpu_fused_ops = false;
+
+    // On a CPU primary, run the relative-position attention as one AMX-FP16 kernel (ggml-cpu/amx/fa.h) where it is
+    // built in. It rounds its inputs and the softmax weights to f16, so the results change slightly.
+    bool cpu_fa_fp16 = false;
 };
 
 // Resolve a conv-dispatch toggle from its env overrides. The DIRECT var forces

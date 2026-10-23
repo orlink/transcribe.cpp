@@ -117,6 +117,7 @@ EncoderBuild build_encoder_graph(ggml_context *        ctx,
     policy.direct_dw_in_pre_encode = detect_direct_dw_in_pre_encode(backend_name);
     policy.cpu_fused_ops           = backend_name != nullptr && std::strcmp(backend_name, "CPU") == 0 &&
                                      !transcribe::env::flag("TRANSCRIBE_NO_CPU_FUSED_OPS");
+    policy.cpu_fa_fp16             = policy.cpu_fused_ops && transcribe::env::flag("TRANSCRIBE_CPU_FA_FP16");
 
     EncoderBuild eb{};
 
