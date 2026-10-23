@@ -367,6 +367,24 @@ add_test(NAME transcribe_conv_pw_promote_unit
     COMMAND transcribe_conv_pw_promote_unit)
 
 # -----------------------------------------------------------------------------
+# Grouped Q8_0 scales: quantizer, and ggml's grouped AMX layout where the CPU
+# has AMX (those cases are skipped elsewhere)
+# -----------------------------------------------------------------------------
+
+add_executable(transcribe_q8_0_grouped_unit
+    q8_0_grouped_unit.cpp)
+
+target_link_libraries(transcribe_q8_0_grouped_unit PRIVATE transcribe ggml)
+
+target_include_directories(transcribe_q8_0_grouped_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_q8_0_grouped_unit)
+
+add_test(NAME transcribe_q8_0_grouped_unit
+    COMMAND transcribe_q8_0_grouped_unit)
+
+# -----------------------------------------------------------------------------
 # causal_lm::pack_gate_up: alias / copy / mismatch, no model needed
 # -----------------------------------------------------------------------------
 

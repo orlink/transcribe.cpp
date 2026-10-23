@@ -17,9 +17,11 @@
 #include "transcribe-backend.h"
 #include "transcribe-env.h"
 #include "transcribe-log.h"
+#include "transcribe-meta.h"
 #include "transcribe-path.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +29,7 @@
 #include <fstream>
 #include <ios>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace transcribe::load_common {
@@ -1012,7 +1015,8 @@ transcribe_status quantize_conv_pw_for_cpu_repack(const BackendPlan &           
                                                   const char *                       error_tag,
                                                   ggml_context **                    out_ctx,
                                                   WeightStorage &                    storage,
-                                                  bool *                             done) {
+                                                  bool *                             done,
+                                                  int                                q8_0_group) {
     *done = false;
     if (plan.primary_kind != BackendKind::Cpu || plan.primary == nullptr || slots.empty() || !direct_pw ||
         !cpu_repack_allowed() || !env::flag("TRANSCRIBE_CPU_CONV_PW_Q8_0")) {
@@ -1073,16 +1077,100 @@ transcribe_status quantize_conv_pw_for_cpu_repack(const BackendPlan &           
         } else {
             std::memcpy(f32.data(), raw.data(), raw.size());
         }
-        ggml_quantize_chunk(GGML_TYPE_Q8_0, f32.data(), q8.data(), 0, dst->ne[1], dst->ne[0], nullptr);
+        if (q8_0_group >= 0) {
+            quantize_q8_0_grouped(f32.data(), q8.data(), dst->ne[1], dst->ne[0], q8_0_group);
+        } else {
+            ggml_quantize_chunk(GGML_TYPE_Q8_0, f32.data(), q8.data(), 0, dst->ne[1], dst->ne[0], nullptr);
+        }
         ggml_backend_tensor_set(dst, q8.data(), 0, q8.size());  // whole: the repack buffer converts it
         *slots[i].dst_slot = dst;
     }
 
     *out_ctx = ctx;
     *done    = true;
-    log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "%s: quantized %zu conv pointwise weights to Q8_0 in %s", error_tag,
-            slots.size(), ggml_backend_buft_name(buft));
+    log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "%s: quantized %zu conv pointwise weights to Q8_0%s in %s", error_tag,
+            slots.size(), q8_0_group >= 0 ? " (grouped scales)" : "", ggml_backend_buft_name(buft));
     return TRANSCRIBE_OK;
+}
+
+namespace {
+// ggml's block_q8_0 (ggml-common.h is not a public header)
+constexpr int64_t k_q8_0_block = 32;
+
+struct BlockQ8_0 {
+    ggml_fp16_t d;
+    int8_t      qs[k_q8_0_block];
+};
+}  // namespace
+
+void quantize_q8_0_grouped(const float * src, void * dst, int64_t nrows, int64_t k, int group) {
+    static_assert(sizeof(BlockQ8_0) == 2 + k_q8_0_block, "block_q8_0 layout");
+    GGML_ASSERT(ggml_blck_size(GGML_TYPE_Q8_0) == k_q8_0_block && ggml_type_size(GGML_TYPE_Q8_0) == sizeof(BlockQ8_0));
+    const int64_t g   = group > 0 && group < k ? group : k;
+    auto *        out = static_cast<BlockQ8_0 *>(dst);
+    for (int64_t r = 0; r < nrows; ++r) {
+        const float * x = src + r * k;
+        BlockQ8_0 *   y = out + r * (k / k_q8_0_block);
+        for (int64_t g0 = 0; g0 < k; g0 += g) {
+            float amax = 0.0f;
+            for (int64_t i = g0; i < g0 + g; ++i) {
+                amax = std::max(amax, std::fabs(x[i]));
+            }
+            const ggml_fp16_t dh = ggml_fp32_to_fp16(amax / 127.0f);
+            const float       d  = ggml_fp16_to_fp32(dh);
+            const float       id = d != 0.0f ? 1.0f / d : 0.0f;
+            for (int64_t b = g0 / k_q8_0_block; b < (g0 + g) / k_q8_0_block; ++b) {
+                y[b].d = dh;
+            }
+            for (int64_t i = g0; i < g0 + g; ++i) {
+                const float v                            = std::clamp(std::nearbyint(x[i] * id), -127.0f, 127.0f);
+                y[i / k_q8_0_block].qs[i % k_q8_0_block] = static_cast<int8_t>(v);
+            }
+        }
+    }
+}
+
+transcribe_status read_q8_0_grouping(const gguf_context * gguf, const char * error_tag, Q8_0Grouping & out) {
+    out        = Q8_0Grouping{};
+    int32_t wg = -1;
+    int32_t ag = 0;
+    if (const transcribe_status st = read_optional_int32_kv(gguf, "stt.q8_0.weight_group", error_tag, -1, wg);
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
+    if (const transcribe_status st = read_optional_int32_kv(gguf, "stt.q8_0.act_group", error_tag, 0, ag);
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
+    if (wg < 0 || env::flag("TRANSCRIBE_NO_Q8_0_GROUPED")) {
+        return TRANSCRIBE_OK;
+    }
+    if (const char * v = env::str("TRANSCRIBE_Q8_0_ACT_GROUP")) {
+        ag = std::atoi(v);
+    }
+    out.weight_group = wg;
+    out.act_group    = std::max(0, static_cast<int>(ag));
+    log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "%s: grouped Q8_0 scales: weights per %s, activations per %s", error_tag,
+            wg == 0 ? "row" : std::to_string(wg).c_str(), out.act_group == 0 ? "row" : std::to_string(ag).c_str());
+    return TRANSCRIBE_OK;
+}
+
+ScopedCpuQ8_0Grouping::ScopedCpuQ8_0Grouping(const BackendPlan & plan, const Q8_0Grouping & g) {
+    if (!g.on() || plan.primary_kind != BackendKind::Cpu || plan.primary == nullptr) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(plan.primary));
+    set_                   = reinterpret_cast<void (*)(int)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_amx_set_q8_0_grouped"));
+    if (set_ != nullptr) {
+        set_(g.act_group);
+    }
+}
+
+ScopedCpuQ8_0Grouping::~ScopedCpuQ8_0Grouping() {
+    if (set_ != nullptr) {
+        set_(-1);
+    }
 }
 
 ReadF32Result read_f32_tensor_checked(gguf_context *       gguf_ctx,

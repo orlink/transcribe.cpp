@@ -332,7 +332,7 @@ transcribe_status fuse_batch_norm(CanaryModel & m) {
 // from F16 to F32. Same rationale as parakeet/cohere. With
 // TRANSCRIBE_CPU_CONV_PW_Q8_0 on and a CPU matrix buffer type available,
 // quantize them to Q8_0 in that buffer type instead.
-transcribe_status promote_conv_pw_to_f32_on_cpu(CanaryModel & m) {
+transcribe_status promote_conv_pw_to_f32_on_cpu(CanaryModel & m, const load_common::Q8_0Grouping & grouping) {
     std::vector<load_common::ConvPwF32Slot> slots;
     slots.reserve(m.weights.blocks.size() * 2);
     for (auto & b : m.weights.blocks) {
@@ -344,9 +344,9 @@ transcribe_status promote_conv_pw_to_f32_on_cpu(CanaryModel & m) {
         }
     }
     bool quantized = false;
-    if (const transcribe_status st =
-            load_common::quantize_conv_pw_for_cpu_repack(m.plan, slots, conformer::detect_direct_pw(m.backend.c_str()),
-                                                         "canary", &m.conv_pw_f32_ctx, m.weight_storage, &quantized);
+    if (const transcribe_status st = load_common::quantize_conv_pw_for_cpu_repack(
+            m.plan, slots, conformer::detect_direct_pw(m.backend.c_str()), "canary", &m.conv_pw_f32_ctx,
+            m.weight_storage, &quantized, grouping.weight_group);
         st != TRANSCRIBE_OK || quantized) {
         return st;
     }
@@ -539,6 +539,15 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     m->backend         = ggml_backend_name(m->plan.primary);
     m->primary_backend = m->plan.primary;
 
+    // a file with grouped Q8_0 scales may use ggml's grouped AMX layout for its matrix weights
+    transcribe::load_common::Q8_0Grouping grouping;
+    if (const transcribe_status st = transcribe::load_common::read_q8_0_grouping(gguf_data, "canary", grouping);
+        st != TRANSCRIBE_OK) {
+        gguf_free(gguf_data);
+        return st;
+    }
+    const transcribe::load_common::ScopedCpuQ8_0Grouping grouped_layout(m->plan, grouping);
+
     const transcribe::load_common::MulMatWeights mul_mat_weights = canary_mul_mat_weights(m->weights);
     if (const transcribe_status st = transcribe::load_common::load_weights(
             loader.path(), gguf_data, m->ctx_meta, m->plan, params, "canary", m->weight_storage, &mul_mat_weights);
@@ -552,7 +561,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     if (const transcribe_status st = fuse_batch_norm(*m); st != TRANSCRIBE_OK) {
         return st;
     }
-    if (const transcribe_status st = promote_conv_pw_to_f32_on_cpu(*m); st != TRANSCRIBE_OK) {
+    if (const transcribe_status st = promote_conv_pw_to_f32_on_cpu(*m, grouping); st != TRANSCRIBE_OK) {
         return st;
     }
 

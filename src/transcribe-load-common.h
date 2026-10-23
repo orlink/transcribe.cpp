@@ -310,13 +310,56 @@ transcribe_status promote_conv_pw_f16_to_f32_on_cpu(const BackendPlan &         
 // (each *dst_slot repointed, the replacements owned by `storage`); with
 // *done == false nothing was changed and the caller falls back to its usual
 // path (e.g. the F32 promotion). Errors: TRANSCRIBE_ERR_OOM.
+//
+// q8_0_group >= 0 quantizes with one scale per group of that many values (0:
+// one per row) instead of Q8_0's one per 32, for a model with grouped Q8_0
+// scales (see Q8_0Grouping).
 transcribe_status quantize_conv_pw_for_cpu_repack(const BackendPlan &                plan,
                                                   const std::vector<ConvPwF32Slot> & slots,
                                                   bool                               direct_pw,
                                                   const char *                       error_tag,
                                                   ggml_context **                    out_ctx,
                                                   WeightStorage &                    storage,
-                                                  bool *                             done);
+                                                  bool *                             done,
+                                                  int                                q8_0_group = -1);
+
+// Grouped Q8_0 scales: a model file whose Q8_0 matrix weights share one
+// scale per group of values within each row (stt.q8_0.weight_group: values
+// per scale, 0 = one per row). Such a file is a valid Q8_0 file everywhere;
+// on a CPU with AMX, ggml can also keep those weights in a layout whose
+// int8 products are scaled once per group, with the activations quantized
+// per row or per group (stt.q8_0.act_group, 0 = per row; the environment
+// variable TRANSCRIBE_Q8_0_ACT_GROUP overrides it). That changes the
+// rounding, so it is only used for files that ask for it;
+// TRANSCRIBE_NO_Q8_0_GROUPED=1 keeps the standard Q8_0 kernels.
+struct Q8_0Grouping {
+    int weight_group = -1;  // -1: not a grouped file; 0: one scale per row; > 0: values per scale
+    int act_group    = 0;   // 0: one activation scale per row; > 0: values per scale
+
+    bool on() const { return weight_group >= 0; }
+};
+
+// Read the grouping keys (absent: off). Errors: TRANSCRIBE_ERR_GGUF for a
+// key of the wrong type.
+transcribe_status read_q8_0_grouping(const gguf_context * gguf, const char * error_tag, Q8_0Grouping & out);
+
+// While alive, weights converted into the CPU's AMX buffer on this thread
+// may take ggml's grouped layout (a no-op unless g.on(), the primary is the
+// CPU and ggml was built with AMX).
+class ScopedCpuQ8_0Grouping {
+  public:
+    ScopedCpuQ8_0Grouping(const BackendPlan & plan, const Q8_0Grouping & g);
+    ~ScopedCpuQ8_0Grouping();
+    ScopedCpuQ8_0Grouping(const ScopedCpuQ8_0Grouping &)             = delete;
+    ScopedCpuQ8_0Grouping & operator=(const ScopedCpuQ8_0Grouping &) = delete;
+
+  private:
+    void (*set_)(int) = nullptr;
+};
+
+// Quantize nrows rows of k floats to Q8_0 blocks that share one scale
+// (absmax / 127, as Q8_0) per group of `group` values (0: the whole row).
+void quantize_q8_0_grouped(const float * src, void * dst, int64_t nrows, int64_t k, int group);
 
 // Read a small F32 tensor from the GGUF file into a std::vector<float>.
 //
