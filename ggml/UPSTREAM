@@ -24,6 +24,7 @@ patches:
   patches/ggml/0021-cpu-vector-f16-cast-rows.patch
   patches/ggml/0022-cpu-amx-fp16-rel-pos-attention.patch
   patches/ggml/0023-cpu-amx-q8_0-grouped-short-passes.patch
+  patches/ggml/0024-cpu-aligned-work-buffer.patch
 
 This directory is generated from the upstream ggml tree at the SHA above, minus
 .github/, with the listed downstream patches applied in order. Do not edit it by

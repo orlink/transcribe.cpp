@@ -1,0 +1,52 @@
+diff --git a/src/ggml-cpu/ggml-cpu.cpp b/src/ggml-cpu/ggml-cpu.cpp
+index 11aaa47..9097215 100644
+--- a/src/ggml-cpu/ggml-cpu.cpp
++++ b/src/ggml-cpu/ggml-cpu.cpp
+@@ -127,7 +127,9 @@ static void ggml_backend_cpu_free(ggml_backend_t backend) {
+     if (cpu_ctx->owned_threadpool) {
+         ggml_threadpool_free(cpu_ctx->owned_threadpool);
+     }
+-    delete[] cpu_ctx->work_data;
++    if (cpu_ctx->work_data != NULL) {
++        ggml_aligned_free(cpu_ctx->work_data, cpu_ctx->work_size);
++    }
+     delete cpu_ctx;
+     delete backend;
+ }
+@@ -145,8 +147,10 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
+     cpu_plan->cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+     cpu_plan->cgraph = *cgraph; // FIXME: deep copy
+ 
++    // the work buffer holds quantized activations that kernels load in whole cache lines (AMX tiles), so it is
++    // allocated on a cache-line boundary
+     if (cpu_plan->cplan.work_size > 0) {
+-        cpu_plan->cplan.work_data = new uint8_t[cpu_plan->cplan.work_size];
++        cpu_plan->cplan.work_data = (uint8_t *) ggml_aligned_malloc(cpu_plan->cplan.work_size);
+         if (cpu_plan->cplan.work_data == NULL) {
+             delete cpu_plan;
+             return NULL;
+@@ -163,7 +167,9 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
+ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
+     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
+ 
+-    delete[] cpu_plan->cplan.work_data;
++    if (cpu_plan->cplan.work_data != NULL) {
++        ggml_aligned_free(cpu_plan->cplan.work_data, cpu_plan->cplan.work_size);
++    }
+     delete cpu_plan;
+ 
+     GGML_UNUSED(backend);
+@@ -204,8 +210,11 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
+     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, threadpool);
+ 
+     if (cpu_ctx->work_size < cplan.work_size) {
+-        delete[] cpu_ctx->work_data;
+-        cpu_ctx->work_data = new uint8_t[cplan.work_size];
++        if (cpu_ctx->work_data != NULL) {
++            ggml_aligned_free(cpu_ctx->work_data, cpu_ctx->work_size);
++        }
++        // cache-line aligned, as in graph_plan_create
++        cpu_ctx->work_data = (uint8_t *) ggml_aligned_malloc(cplan.work_size);
+         if (cpu_ctx->work_data == NULL) {
+             cpu_ctx->work_size = 0;
+             return GGML_STATUS_ALLOC_FAILED;
