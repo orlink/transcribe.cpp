@@ -538,12 +538,12 @@ inline __m512 dot_lanes(const float * x, const __m512 * y, int64_t D) {
 
 // _mm512_reduce_add_ps of 16 vectors at once, lane o of the result being the reduction of u[o], with GCC's tree
 // for each: t3[i] = u[8 + i] + u[i], t6[i] = t3[4 + i] + t3[i], (t6[0] + t6[2]) + (t6[1] + t6[3]).
-inline __m512 reduce_add_x16(const __m512 * u) {
-    __m512 w[8];
-    for (int k = 0; k < 8; ++k) {  // 8 + 8 lanes: t3 of u[2k], u[2k + 1]
-        w[k] = _mm512_add_ps(_mm512_shuffle_f32x4(u[2 * k], u[2 * k + 1], 0xee),
-                             _mm512_shuffle_f32x4(u[2 * k], u[2 * k + 1], 0x44));
-    }
+// reduce_pair is the first step (t3 of two vectors), reduce_add_w8 the rest from the eight pairs.
+inline __m512 reduce_pair(__m512 u0, __m512 u1) {  // 8 + 8 lanes: t3 of u0, u1
+    return _mm512_add_ps(_mm512_shuffle_f32x4(u0, u1, 0xee), _mm512_shuffle_f32x4(u0, u1, 0x44));
+}
+
+inline __m512 reduce_add_w8(const __m512 * w) {
     __m512 z[4];
     for (int k = 0; k < 4; ++k) {  // 4 x 4 lanes: t6 of u[4k] .. u[4k + 3]
         z[k] = _mm512_add_ps(_mm512_shuffle_f32x4(w[2 * k], w[2 * k + 1], 0xdd),
@@ -557,6 +557,14 @@ inline __m512 reduce_add_x16(const __m512 * u) {
     const __m512  r   = _mm512_add_ps(_mm512_shuffle_ps(v[0], v[1], 0x88), _mm512_shuffle_ps(v[0], v[1], 0xdd));
     const __m512i idx = _mm512_setr_epi32(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
     return _mm512_permutexvar_ps(idx, r);
+}
+
+inline __m512 reduce_add_x16(const __m512 * u) {
+    __m512 w[8];
+    for (int k = 0; k < 8; ++k) {
+        w[k] = reduce_pair(u[2 * k], u[2 * k + 1]);
+    }
+    return reduce_add_w8(w);
 }
 
 // Whether ggml_vec_dot_f32 of length D sums as dot_lanes + _mm512_reduce_add_ps, and reduce_add_x16 reduces as
@@ -595,6 +603,68 @@ bool vec_dot_rows_match(int64_t D) {
     return true;
 }
 
+// dot_lanes for a D known at compile time, fully unrolled
+template <int64_t DC> __attribute__((always_inline)) inline __m512 dot_lanes_c(const float * x, const __m512 * y) {
+    __m512 a[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps() };
+#pragma GCC unroll 16
+    for (int64_t i = 0; i < DC; i += 64) {
+#pragma GCC unroll 4
+        for (int j = 0; j < 4; ++j) {
+            a[j] = _mm512_fmadd_ps(_mm512_loadu_ps(x + i + 16 * j), y[i / 16 + j], a[j]);
+        }
+    }
+    return _mm512_add_ps(_mm512_add_ps(a[0], a[2]), _mm512_add_ps(a[1], a[3]));
+}
+
+// Scores of the queries i0 .. i0 + nq - 1 of one head against positions packed contiguously: rows[k] is position
+// lo + k, with 16 more rows after the last position the block takes. Query i takes positions T - 1 - i + j for
+// j = 0 .. T - 1. The positions are visited in tiles of 16 that all queries of the block use in turn while the tile
+// is in L1; each score is dot_lanes + reduce_add_x16 as before (lanes outside 0 .. T - 1 are computed from other
+// rows and not stored). DC is D when known at compile time (0: use D).
+template <int64_t DC>
+void rel_pos_query_block(const float * rows, int64_t lo, const ggml_tensor * q, int64_t h, int64_t i0, int64_t nq,
+                         int64_t T, int64_t D_rt, __m512 sv, ggml_tensor * dst) {
+    const int64_t D     = DC > 0 ? DC : D_rt;
+    // positions of the block: T - i0 - nq .. 2T - 2 - i0
+    const int64_t p_beg = T - i0 - nq;
+    const int64_t p_end = 2 * T - 1 - i0;
+    __m512        yv[DC > 0 ? DC / 16 : 64];
+    for (int64_t pt = p_beg; pt < p_end; pt += 16) {
+        for (int64_t i = i0; i < i0 + nq; ++i) {
+            // j of position pt for query i; the tile covers j0 .. j0 + 15, of which 0 .. T - 1 exist
+            const int64_t j0 = pt - (T - 1 - i);
+            const int64_t a  = std::max<int64_t>(0, -j0);
+            const int64_t b  = std::min<int64_t>(16, T - j0);
+            if (a >= b) {
+                continue;
+            }
+            const float * qr = (const float *) ((const char *) q->data + i * q->nb[1] + h * q->nb[2]);
+            for (int64_t k = 0; k < D / 16; ++k) {
+                yv[k] = _mm512_loadu_ps(qr + 16 * k);
+            }
+            const float * pr = rows + (pt - lo) * D;
+            __m512        w[8];
+            if (DC > 0) {
+#pragma GCC unroll 8
+                for (int k = 0; k < 8; ++k) {
+                    const __m512 u0 = dot_lanes_c<DC>(pr + 2 * k * DC, yv);
+                    const __m512 u1 = dot_lanes_c<DC>(pr + (2 * k + 1) * DC, yv);
+                    w[k]            = reduce_pair(u0, u1);
+                }
+            } else {
+                for (int k = 0; k < 8; ++k) {
+                    w[k] = reduce_pair(dot_lanes(pr + 2 * k * D, yv, D), dot_lanes(pr + (2 * k + 1) * D, yv, D));
+                }
+            }
+            const __m512    sc  = _mm512_mul_ps(reduce_add_w8(w), sv);
+            const __m256i   h16 = _mm512_cvtps_ph(sc, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            ggml_fp16_t *   out = (ggml_fp16_t *) ((char *) dst->data + i * dst->nb[1] + h * dst->nb[2]);
+            const __mmask16 m   = (__mmask16) (((1u << b) - 1) & ~((1u << a) - 1));
+            _mm256_mask_storeu_epi16(out + j0, m, h16);
+        }
+    }
+}
+
 void rel_pos_scores_f16(ggml_tensor * dst, int ith, int nth, void * userdata) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * p = dst->src[1];
@@ -606,37 +676,41 @@ void rel_pos_scores_f16(ggml_tensor * dst, int ith, int nth, void * userdata) {
     const int64_t T = q->ne[1];
     const int64_t H = q->ne[2];
 
-    const __m512 sv     = _mm512_set1_ps(scale);
-    const int64_t n_row = H * T;
-    const int64_t r0    = n_row * ith / nth;
-    const int64_t r1    = n_row * (ith + 1) / nth;
-    __m512        yv[64];  // D <= 1024
-    for (int64_t r = r0; r < r1; ++r) {
+    // queries per pass over a tile of positions
+    constexpr int64_t k_query_block = 8;
+
+    const __m512                           sv    = _mm512_set1_ps(scale);
+    const int64_t                          n_row = H * T;
+    const int64_t                          r0    = n_row * ith / nth;
+    const int64_t                          r1    = n_row * (ith + 1) / nth;
+    static thread_local std::vector<float> rows;
+    for (int64_t r = r0; r < r1;) {
+        // this thread's queries i0 .. i1 - 1 of head h, and the positions they take, T - i1 .. 2T - 2 - i0, copied
+        // to consecutive rows (in the projection's layout consecutive positions of a head are H rows apart)
         const int64_t h  = r / T;
-        const int64_t i  = r % T;
-        const float * qr = (const float *) ((const char *) q->data + i * q->nb[1] + h * q->nb[2]);
-        for (int64_t k = 0; k < D / 16; ++k) {
-            yv[k] = _mm512_loadu_ps(qr + 16 * k);
+        const int64_t i0 = r % T;
+        const int64_t i1 = std::min(T, i0 + (r1 - r));
+        const int64_t lo = T - i1;
+        const int64_t n  = T + (i1 - i0) - 1;
+        if ((int64_t) rows.size() < (n + 16) * D) {
+            rows.assign((n + 16) * D, 0.0f);
         }
-        const char *  pb  = (const char *) p->data + h * p->nb[2] + (T - 1 - i) * p->nb[1];
-        ggml_fp16_t * out = (ggml_fp16_t *) ((char *) dst->data + i * dst->nb[1] + h * dst->nb[2]);
-        for (int64_t j0 = 0; j0 < T; j0 += 16) {
-            const int64_t nj = std::min<int64_t>(16, T - j0);
-            __m512        u[16];
-            for (int64_t o = 0; o < 16; ++o) {
-                u[o] = o < nj ? dot_lanes((const float *) (pb + (j0 + o) * p->nb[1]), yv, D) : _mm512_setzero_ps();
-            }
-            const __m512  sc = _mm512_mul_ps(reduce_add_x16(u), sv);
-            const __m256i h16 = _mm512_cvtps_ph(sc, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-            if (nj == 16) {
-                _mm256_storeu_si256((__m256i *) (out + j0), h16);
+        for (int64_t k = 0; k < n; ++k) {
+            memcpy(rows.data() + k * D, (const char *) p->data + h * p->nb[2] + (lo + k) * p->nb[1], D * sizeof(float));
+        }
+        for (int64_t i = i0; i < i1; i += k_query_block) {
+            const int64_t nq = std::min(k_query_block, i1 - i);
+            if (D == 128) {
+                rel_pos_query_block<128>(rows.data(), lo, q, h, i, nq, T, D, sv, dst);
+            } else if (D == 64) {
+                rel_pos_query_block<64>(rows.data(), lo, q, h, i, nq, T, D, sv, dst);
             } else {
-                _mm256_mask_storeu_epi16(out + j0, (__mmask16) ((1u << nj) - 1), h16);
+                rel_pos_query_block<0>(rows.data(), lo, q, h, i, nq, T, D, sv, dst);
             }
         }
+        r += i1 - i0;
     }
 }
-
 
 #endif  // __AVX512BW__ && __AVX512VL__
 

@@ -434,7 +434,8 @@ void test_norm_mul_add(ggml_backend_t cpu) {
 
 // relative-position scores of conformer flash attention: ggml_mul_mat(p, q) over the 2T - 1 positions, the
 // relative shift (a view and its copy), ggml_scale and the cast to the f16 mask
-void test_rel_pos_scores(ggml_backend_t cpu) {
+void test_rel_pos_scores_threads(ggml_backend_t cpu, int n_threads) {
+    ggml_backend_cpu_set_n_threads(cpu, n_threads);
     using Getter           = ggml_custom_op_t (*)(const ggml_tensor *, const ggml_tensor *);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu));
     const Getter       get =
@@ -447,8 +448,8 @@ void test_rel_pos_scores(ggml_backend_t cpu) {
     const float  scale = 1.0f / std::sqrt(128.0f);
     uint32_t     bits  = 0;
     std::memcpy(&bits, &scale, sizeof(bits));
-    for (const int64_t D : { 128, 64 }) {
-        for (const int64_t T : { 1, 7, 25, 62, 133 }) {
+    for (const int64_t D : { 128, 64, 192 }) {
+        for (const int64_t T : { 1, 7, 25, 62, 133, 375 }) {
             const int64_t H = 4;
             const int64_t P = 2 * T - 1;
             // as the attention has them before its permutes: [D, H, T] and [D, H, P]
@@ -489,12 +490,19 @@ void test_rel_pos_scores(ggml_backend_t cpu) {
             CHECK(op != nullptr);
             const int64_t bad = count_differ(res[0], res[1]);
             if (bad != 0) {
-                std::fprintf(stderr, "rel_pos_scores D=%lld T=%lld: %lld differ\n", (long long) D, (long long) T,
-                             (long long) bad);
+                std::fprintf(stderr, "rel_pos_scores D=%lld T=%lld threads=%d: %lld differ\n", (long long) D,
+                             (long long) T, n_threads, (long long) bad);
             }
             CHECK(bad == 0);
         }
     }
+}
+
+// four threads take whole heads, three split heads between threads
+void test_rel_pos_scores(ggml_backend_t cpu) {
+    test_rel_pos_scores_threads(cpu, 4);
+    test_rel_pos_scores_threads(cpu, 3);
+    ggml_backend_cpu_set_n_threads(cpu, 4);
 }
 
 // ggml_argmax against its scalar definition (the last index of the running maximum), with ties, zeros of both
