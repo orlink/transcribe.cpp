@@ -102,6 +102,20 @@ inline void parallel_for_ggml(const ggml_compute_params * params, int n, const f
     f(tbegin, tend);
 }
 
+// define amx tile config data structure
+struct tile_config_t{
+    uint8_t palette_id = 0;
+    uint8_t start_row = 0;
+    uint8_t reserved_0[14] = {0};
+    uint16_t colsb[16] = {0};
+    uint8_t rows[16] = {0};
+};
+
+// the tile configuration this thread has loaded: the kernels of mmq.cpp and those of mmq-grouped.cpp use
+// different ones, so each loads its own when the other's is active
+enum { AMX_TILE_CONFIG_NONE = 0, AMX_TILE_CONFIG_Q = 1, AMX_TILE_CONFIG_GROUPED = 2 };
+inline thread_local int ggml_amx_tile_config_id = AMX_TILE_CONFIG_NONE;
+
 // quantized types that have AMX support
 inline bool qtype_has_amx_kernels(const enum ggml_type type) {
     // TODO: fix padding for vnni format

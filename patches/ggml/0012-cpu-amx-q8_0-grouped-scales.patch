@@ -1,0 +1,821 @@
+diff --git a/src/ggml-cpu/CMakeLists.txt b/src/ggml-cpu/CMakeLists.txt
+index 71f55b4..b1d514a 100644
+--- a/src/ggml-cpu/CMakeLists.txt
++++ b/src/ggml-cpu/CMakeLists.txt
+@@ -41,6 +41,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+         ggml-cpu/amx/amx.h
+         ggml-cpu/amx/mmq.cpp
+         ggml-cpu/amx/mmq.h
++        ggml-cpu/amx/mmq-grouped.cpp
++        ggml-cpu/amx/mmq-grouped.h
+         ggml-cpu/tiled/tiled.cpp
+         ggml-cpu/tiled/tiled.h
+         ggml-cpu/tiled/tiled-kernel.cpp
+diff --git a/src/ggml-cpu/amx/amx.h b/src/ggml-cpu/amx/amx.h
+index 5b65d76..02b4c25 100644
+--- a/src/ggml-cpu/amx/amx.h
++++ b/src/ggml-cpu/amx/amx.h
+@@ -5,4 +5,9 @@
+ 
+ #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+ ggml_backend_buffer_type_t ggml_backend_amx_buffer_type(void);
++
++// Opt-in for the grouped Q8_0 layout (amx/mmq-grouped.h) of weights converted into the AMX buffer from this
++// thread: act_group < 0 off (the default), 0 one activation scale per row, > 0 values per activation scale.
++// A weight takes the grouped layout only if its blocks share one scale per group of values.
++void ggml_backend_amx_set_q8_0_grouped(int act_group);
+ #endif
+diff --git a/src/ggml-cpu/amx/common.h b/src/ggml-cpu/amx/common.h
+index 26a6ec1..3f2a224 100644
+--- a/src/ggml-cpu/amx/common.h
++++ b/src/ggml-cpu/amx/common.h
+@@ -102,6 +102,20 @@ inline void parallel_for_ggml(const ggml_compute_params * params, int n, const f
+     f(tbegin, tend);
+ }
+ 
++// define amx tile config data structure
++struct tile_config_t{
++    uint8_t palette_id = 0;
++    uint8_t start_row = 0;
++    uint8_t reserved_0[14] = {0};
++    uint16_t colsb[16] = {0};
++    uint8_t rows[16] = {0};
++};
++
++// the tile configuration this thread has loaded: the kernels of mmq.cpp and those of mmq-grouped.cpp use
++// different ones, so each loads its own when the other's is active
++enum { AMX_TILE_CONFIG_NONE = 0, AMX_TILE_CONFIG_Q = 1, AMX_TILE_CONFIG_GROUPED = 2 };
++inline thread_local int ggml_amx_tile_config_id = AMX_TILE_CONFIG_NONE;
++
+ // quantized types that have AMX support
+ inline bool qtype_has_amx_kernels(const enum ggml_type type) {
+     // TODO: fix padding for vnni format
+diff --git a/src/ggml-cpu/amx/mmq-grouped.cpp b/src/ggml-cpu/amx/mmq-grouped.cpp
+new file mode 100644
+index 0000000..912b52c
+--- /dev/null
++++ b/src/ggml-cpu/amx/mmq-grouped.cpp
+@@ -0,0 +1,554 @@
++#if defined(__GNUC__)
++#pragma GCC diagnostic ignored "-Wpedantic"
++#endif
++
++#include "mmq-grouped.h"
++#include "amx.h"
++#include "ggml-impl.h"
++#include "ggml-cpu-impl.h"
++#include "simd-mappings.h"
++#include "ggml-quants.h"
++
++#include <algorithm>
++#include <cstring>
++
++#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
++
++#include <immintrin.h>
++
++#if (defined(_WIN32) || defined(_WIN64))
++#define RESTRICT __restrict
++#else
++#define RESTRICT __restrict__
++#endif
++
++namespace {
++
++constexpr uint64_t AMX_Q8_0_GROUPED_MAGIC = 0x31505247305138ull;  // "8Q0GRP1"
++constexpr int      G_TILE                 = TILE_M * 64;          // bytes of one 16 x 64 int8 tile
++constexpr int      G_RING                 = 3;                    // stored running totals: two groups + the next
++
++// activation group for weights converted on this thread: -1 off, 0 one scale per row, > 0 values per scale
++thread_local int g_load_act_group = -1;
++
++// all eight tiles 16 rows x 64 bytes: A and B tiles hold 64 int8 values per row, C tiles 16 int32
++void grouped_tile_config() {
++    if (ggml_amx_tile_config_id == AMX_TILE_CONFIG_GROUPED) {
++        return;
++    }
++    alignas(64) tile_config_t tc = {};
++    tc.palette_id                = 1;
++    for (int t = 0; t < 8; ++t) {
++        tc.rows[t]  = TILE_M;
++        tc.colsb[t] = 64;
++    }
++    _tile_loadconfig(&tc);
++    ggml_amx_tile_config_id = AMX_TILE_CONFIG_GROUPED;
++}
++
++// the largest of (K, 512, 256, 128, 64) values per group in which every row's blocks share one scale, or 0
++int detect_weight_group(const block_q8_0 * B, int N, int K) {
++    const int KB      = K / QK8_0;
++    const int cand[5] = { K, 512, 256, 128, 64 };
++    for (int G : cand) {
++        if (G > K || K % G != 0 || G % 64 != 0) {
++            continue;
++        }
++        const int nb = G / QK8_0;
++        bool      ok = true;
++        for (int64_t n = 0; n < N && ok; ++n) {
++            const block_q8_0 * row = B + n * KB;
++            for (int kb = 0; kb < KB; ++kb) {
++                if (row[kb].d != row[kb - kb % nb].d) {
++                    ok = false;
++                    break;
++                }
++            }
++        }
++        if (ok) {
++            return G;
++        }
++    }
++    return 0;
++}
++
++// one activation row to int8 with one scale per `ag` values (amax / 127, as Q8_0 computes it). Tile order: value k
++// goes to a[(k / 64) * G_TILE + k % 64], the row's place in its 16-row tile block. Plain order (the VNNI kernels):
++// a[k] = the value + 128, as uint8.
++template <bool PLAIN>
++void quantize_row(const float * RESTRICT x, int8_t * RESTRICT a, float * RESTRICT as, int K, int ag) {
++    const __m512 sign = _mm512_set1_ps(-0.0f);
++    for (int g0 = 0; g0 < K; g0 += ag) {
++        __m512 m0 = _mm512_setzero_ps();
++        __m512 m1 = _mm512_setzero_ps();
++        __m512 m2 = _mm512_setzero_ps();
++        __m512 m3 = _mm512_setzero_ps();
++        for (int k = g0; k < g0 + ag; k += 64) {
++            m0 = _mm512_max_ps(m0, _mm512_andnot_ps(sign, _mm512_loadu_ps(x + k)));
++            m1 = _mm512_max_ps(m1, _mm512_andnot_ps(sign, _mm512_loadu_ps(x + k + 16)));
++            m2 = _mm512_max_ps(m2, _mm512_andnot_ps(sign, _mm512_loadu_ps(x + k + 32)));
++            m3 = _mm512_max_ps(m3, _mm512_andnot_ps(sign, _mm512_loadu_ps(x + k + 48)));
++        }
++        const float d  = _mm512_reduce_max_ps(_mm512_max_ps(_mm512_max_ps(m0, m1), _mm512_max_ps(m2, m3))) / 127.0f;
++        const float id = d != 0.0f ? 1.0f / d : 0.0f;
++        as[g0 / ag]    = d;
++        const __m512 vid = _mm512_set1_ps(id);
++        for (int k = g0; k < g0 + ag; k += 64) {
++            __m128i q[4];
++            for (int j = 0; j < 4; ++j) {
++                const __m512i v = _mm512_cvt_roundps_epi32(_mm512_mul_ps(_mm512_loadu_ps(x + k + 16 * j), vid),
++                                                           _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
++                q[j]            = _mm512_cvtsepi32_epi8(v);
++            }
++            __m512i v = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set_m128i(q[1], q[0])),
++                                           _mm256_set_m128i(q[3], q[2]), 1);
++            if constexpr (PLAIN) {
++                _mm512_storeu_si512((__m512i *) (a + k), _mm512_xor_si512(v, _mm512_set1_epi8((char) 0x80)));
++            } else {
++                _mm512_storeu_si512((__m512i *) (a + (size_t) (unsigned) (k >> 6) * G_TILE), v);
++            }
++        }
++    }
++}
++
++// scaling groups: R values per scaled add (the smaller of the weight and activation groups), NR per row, SR tile
++// steps of 64 values each
++struct group_scales {
++    int R, NR, SR, NGw, NGa, wg, ag;
++
++    explicit group_scales(const amx_q8_0_grouped_info & gi) :
++        R(std::min(gi.wg, gi.ag)),
++        NR(gi.K / R),
++        SR(R / 64),
++        NGw(gi.K / gi.wg),
++        NGa(gi.K / gi.ag),
++        wg(gi.wg),
++        ag(gi.ag) {}
++};
++
++// 16 outputs of one row: c (+)= group sum x weight scales w x activation scale a. The group sum is cur, the running
++// total after this group, minus prev, the total after the group before (none for the first group).
++inline void acc_row(float * RESTRICT c, const int32_t * RESTRICT cur, const int32_t * RESTRICT prev, __m512 w,
++                    float a, bool first) {
++    __m512i v = _mm512_load_si512(cur);
++    if (!first) {
++        v = _mm512_sub_epi32(v, _mm512_load_si512(prev));
++    }
++    const __m512 s = _mm512_mul_ps(w, _mm512_set1_ps(a));
++    const __m512 f = _mm512_cvtepi32_ps(v);
++    _mm512_store_ps(c, first ? _mm512_mul_ps(f, s) : _mm512_fmadd_ps(f, s, _mm512_load_ps(c)));
++}
++
++inline void write_row(float * RESTRICT dst, const float * RESTRICT c, const float * RESTRICT bias, int n16) {
++    for (int t = 0; t < n16; ++t) {
++        __m512 v = _mm512_load_ps(c + t * 16);
++        if (bias != nullptr) {
++            // the bias add of a fused MUL_MAT + ADD: one rounding, as the ADD node
++            v = _mm512_add_ps(v, _mm512_loadu_ps(bias + t * 16));
++        }
++        _mm512_storeu_ps(dst + t * 16, v);
++    }
++}
++
++// ROWS (1..AMX_GROUPED_VNNI_ROWS) rows x NT weight tiles from column tile nt0 with AVX512-VNNI, which streams the
++// weights with ordinary loads (the tile loads of the AMX kernels keep too few of them in flight when the weights
++// come from memory). A: rows of K activations + 128 as uint8 (row stride K); each group's sums are
++// sum((a + 128) * w) - 128 * sum(w), the column sums made at load (wsum).
++constexpr int AMX_GROUPED_VNNI_ROWS = 8;
++
++template <int ROWS, int NT>
++void grouped_vnni_rows(const amx_q8_0_grouped_info & gi, const group_scales & gs, const int8_t * RESTRICT W,
++                       const float * RESTRICT Ws, const int32_t * RESTRICT Wsum, const uint8_t * RESTRICT A,
++                       const float * RESTRICT as, int nt0, float * RESTRICT C, int ldc, const float * RESTRICT bias) {
++    const int K  = gi.K;
++    const int KS = K / 64;
++    __m512    vc[ROWS][NT];
++    for (int r = 0; r < ROWS; ++r) {
++        for (int c = 0; c < NT; ++c) {
++            vc[r][c] = _mm512_setzero_ps();
++        }
++    }
++    for (int g = 0; g < gs.NR; ++g) {
++        const int gw = g * gs.R / gs.wg;
++        const int ga = g * gs.R / gs.ag;
++        for (int c = 0; c < NT; ++c) {
++            const int nt = nt0 + c;
++            __m512i   acc[2][ROWS];
++            for (int r = 0; r < ROWS; ++r) {
++                acc[0][r] = _mm512_setzero_si512();
++                acc[1][r] = _mm512_setzero_si512();
++            }
++            for (int s = 0; s < gs.SR; ++s) {
++                const int      ks = g * gs.SR + s;
++                const int8_t * w  = W + ((size_t) nt * KS + ks) * G_TILE;
++                const uint8_t * a = A + (size_t) ks * 64;
++#pragma GCC unroll 16
++                for (int j = 0; j < 16; ++j) {
++                    const __m512i vw = _mm512_loadu_si512((const __m512i *) (w + 64 * j));
++                    for (int r = 0; r < ROWS; ++r) {
++                        int32_t av;
++                        memcpy(&av, a + (size_t) r * K + 4 * j, sizeof(av));
++                        acc[j % 2][r] = _mm512_dpbusd_epi32(acc[j % 2][r], _mm512_set1_epi32(av), vw);
++                    }
++                }
++            }
++            const __m512  ws   = _mm512_loadu_ps(Ws + ((size_t) nt * gs.NGw + gw) * TILE_N);
++            const __m512i corr = _mm512_loadu_si512((const __m512i *) (Wsum + ((size_t) nt * gs.NR + g) * TILE_N));
++            for (int r = 0; r < ROWS; ++r) {
++                const __m512i sum = _mm512_sub_epi32(_mm512_add_epi32(acc[0][r], acc[1][r]), corr);
++                vc[r][c] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sum), _mm512_mul_ps(ws, _mm512_set1_ps(as[(size_t) r * gs.NGa + ga])),
++                                           vc[r][c]);
++            }
++        }
++    }
++    for (int r = 0; r < ROWS; ++r) {
++        for (int c = 0; c < NT; ++c) {
++            __m512 v = vc[r][c];
++            if (bias != nullptr) {
++                v = _mm512_add_ps(v, _mm512_loadu_ps(bias + c * TILE_N));
++            }
++            _mm512_storeu_ps(C + (size_t) r * ldc + c * TILE_N, v);
++        }
++    }
++}
++
++template <int ROWS>
++void grouped_vnni_dispatch(const amx_q8_0_grouped_info & gi, const group_scales & gs, int rows, int nt,
++                           const int8_t * W, const float * Ws, const int32_t * Wsum, const uint8_t * A,
++                           const float * as, int nt0, float * C, int ldc, const float * bias) {
++    if constexpr (ROWS > 1) {
++        if (rows < ROWS) {
++            grouped_vnni_dispatch<ROWS - 1>(gi, gs, rows, nt, W, Ws, Wsum, A, as, nt0, C, ldc, bias);
++            return;
++        }
++    }
++    if (nt == 4) {
++        grouped_vnni_rows<ROWS, 4>(gi, gs, W, Ws, Wsum, A, as, nt0, C, ldc, bias);
++    } else {
++        grouped_vnni_rows<ROWS, 2>(gi, gs, W, Ws, Wsum, A, as, nt0, C, ldc, bias);
++    }
++}
++
++// up to 16 rows: one A tile against nt (4, or 2 at the edge) weight tiles from column tile nt0. Tiles: A 3,
++// B 0-2 (rotating), C 4-7. The C tiles accumulate over K; each group's sums are the difference of two stored
++// running totals, and a group is scaled while the next one's tiles are computed.
++void grouped_rows16(const amx_q8_0_grouped_info & gi, const group_scales & gs, const int8_t * RESTRICT W,
++                    const float * RESTRICT Ws, const int8_t * RESTRICT A, const float * RESTRICT as, int M, int nt0,
++                    int nt, float * RESTRICT C, int ldc, const float * RESTRICT bias) {
++    const int     KS = gi.K / 64;
++    const size_t  TS = (size_t) KS * G_TILE;
++    const int8_t * W0 = W + nt0 * TS;
++    alignas(64) int32_t ring[G_RING][4][TILE_M * TILE_N];
++    alignas(64) float   acc[TILE_M][64];
++
++    auto consume = [&](int g) {
++        const int gw = g * gs.R / gs.wg;
++        const int ga = g * gs.R / gs.ag;
++        for (int t = 0; t < nt; ++t) {
++            const __m512    w    = _mm512_loadu_ps(Ws + ((size_t) (nt0 + t) * gs.NGw + gw) * TILE_N);
++            const int32_t * cur  = ring[g % G_RING][t];
++            const int32_t * prev = ring[(g + G_RING - 1) % G_RING][t];
++            for (int r = 0; r < M; ++r) {
++                acc_row(&acc[r][t * 16], cur + r * TILE_N, prev + r * TILE_N, w, as[(size_t) r * gs.NGa + ga], g == 0);
++            }
++        }
++    };
++
++    _tile_zero(TMM4);
++    _tile_zero(TMM5);
++    _tile_zero(TMM6);
++    _tile_zero(TMM7);
++    for (int g = 0; g < gs.NR; ++g) {
++        for (int s = 0; s < gs.SR; ++s) {
++            const size_t ko = (size_t) (g * gs.SR + s) * G_TILE;
++            _tile_loadd(TMM3, A + ko, 64);
++            _tile_loadd(TMM0, W0 + ko, 64);
++            _tile_dpbssd(TMM4, TMM3, TMM0);
++            _tile_loadd(TMM1, W0 + TS + ko, 64);
++            _tile_dpbssd(TMM5, TMM3, TMM1);
++            if (nt == 4) {
++                _tile_loadd(TMM2, W0 + 2 * TS + ko, 64);
++                _tile_dpbssd(TMM6, TMM3, TMM2);
++                _tile_loadd(TMM0, W0 + 3 * TS + ko, 64);
++                _tile_dpbssd(TMM7, TMM3, TMM0);
++            }
++        }
++        int32_t(*cur)[TILE_M * TILE_N] = ring[g % G_RING];
++        _tile_stored(TMM4, cur[0], 64);
++        _tile_stored(TMM5, cur[1], 64);
++        if (nt == 4) {
++            _tile_stored(TMM6, cur[2], 64);
++            _tile_stored(TMM7, cur[3], 64);
++        }
++        if (g > 0) {
++            consume(g - 1);
++        }
++    }
++    consume(gs.NR - 1);
++    for (int r = 0; r < M; ++r) {
++        write_row(C + (size_t) r * ldc, acc[r], bias, nt);
++    }
++}
++
++// one 32-column panel (column tiles 2 nb, 2 nb + 1) for all rows, two 16-row A tiles at a time. Tiles: B 0-1,
++// A 2-3, C 4 / 6 (first A tile x B 0 / 1) and 5 / 7 (second A tile).
++void grouped_panel(const amx_q8_0_grouped_info & gi, const group_scales & gs, const int8_t * RESTRICT W,
++                   const float * RESTRICT Ws, const int8_t * RESTRICT A, const float * RESTRICT as, int M, int nb,
++                   float * RESTRICT C, int ldc, const float * RESTRICT bias) {
++    const int      KS  = gi.K / 64;
++    const size_t   TS  = (size_t) KS * G_TILE;
++    const int      MT  = (M + TILE_M - 1) / TILE_M;
++    const int8_t * B0  = W + (size_t) (2 * nb) * TS;
++    const int8_t * B1  = B0 + TS;
++    const float *  ws0 = Ws + (size_t) (2 * nb) * gs.NGw * TILE_N;
++    const float *  ws1 = ws0 + (size_t) gs.NGw * TILE_N;
++    alignas(64) int32_t ring[G_RING][4][TILE_M * TILE_N];
++    alignas(64) float   cb[2 * TILE_M][2 * TILE_N];
++
++    for (int mt = 0; mt < MT; mt += 2) {
++        const bool     two = mt + 1 < MT;
++        const int      nr0 = std::min(TILE_M, M - mt * TILE_M);
++        const int      nr1 = two ? std::min(TILE_M, M - (mt + 1) * TILE_M) : 0;
++        const int8_t * A0  = A + (size_t) mt * TS;
++        const int8_t * A1  = A0 + TS;
++        const float *  s0  = as + (size_t) mt * TILE_M * gs.NGa;
++        const float *  s1  = s0 + (size_t) TILE_M * gs.NGa;
++
++        auto consume = [&](int g) {
++            const int       gw   = g * gs.R / gs.wg;
++            const int       ga   = g * gs.R / gs.ag;
++            const __m512    w0   = _mm512_loadu_ps(ws0 + (size_t) gw * TILE_N);
++            const __m512    w1   = _mm512_loadu_ps(ws1 + (size_t) gw * TILE_N);
++            const int32_t(*cur)[TILE_M * TILE_N]  = ring[g % G_RING];
++            const int32_t(*prev)[TILE_M * TILE_N] = ring[(g + G_RING - 1) % G_RING];
++            const bool first = g == 0;
++            for (int r = 0; r < nr0; ++r) {
++                const float a = s0[(size_t) r * gs.NGa + ga];
++                acc_row(&cb[r][0], cur[0] + r * TILE_N, prev[0] + r * TILE_N, w0, a, first);
++                acc_row(&cb[r][TILE_N], cur[2] + r * TILE_N, prev[2] + r * TILE_N, w1, a, first);
++            }
++            for (int r = 0; r < nr1; ++r) {
++                const float a = s1[(size_t) r * gs.NGa + ga];
++                acc_row(&cb[TILE_M + r][0], cur[1] + r * TILE_N, prev[1] + r * TILE_N, w0, a, first);
++                acc_row(&cb[TILE_M + r][TILE_N], cur[3] + r * TILE_N, prev[3] + r * TILE_N, w1, a, first);
++            }
++        };
++
++        _tile_zero(TMM4);
++        _tile_zero(TMM6);
++        if (two) {
++            _tile_zero(TMM5);
++            _tile_zero(TMM7);
++        }
++        for (int g = 0; g < gs.NR; ++g) {
++            for (int s = 0; s < gs.SR; ++s) {
++                const size_t ko = (size_t) (g * gs.SR + s) * G_TILE;
++                _tile_loadd(TMM2, A0 + ko, 64);
++                _tile_loadd(TMM0, B0 + ko, 64);
++                _tile_dpbssd(TMM4, TMM2, TMM0);
++                _tile_loadd(TMM1, B1 + ko, 64);
++                _tile_dpbssd(TMM6, TMM2, TMM1);
++                if (two) {
++                    _tile_loadd(TMM3, A1 + ko, 64);
++                    _tile_dpbssd(TMM5, TMM3, TMM0);
++                    _tile_dpbssd(TMM7, TMM3, TMM1);
++                }
++            }
++            int32_t(*cur)[TILE_M * TILE_N] = ring[g % G_RING];
++            _tile_stored(TMM4, cur[0], 64);
++            _tile_stored(TMM6, cur[2], 64);
++            if (two) {
++                _tile_stored(TMM5, cur[1], 64);
++                _tile_stored(TMM7, cur[3], 64);
++            }
++            if (g > 0) {
++                consume(g - 1);
++            }
++        }
++        consume(gs.NR - 1);
++        for (int r = 0; r < nr0 + nr1; ++r) {
++            write_row(C + (size_t) (mt * TILE_M + r) * ldc, cb[r], bias, 2);
++        }
++    }
++}
++
++}  // namespace
++
++void ggml_backend_amx_set_q8_0_grouped(int act_group) {
++    g_load_act_group = act_group;
++}
++
++void amx_q8_0_grouped_clear(void * trailer) {
++    memset(trailer, 0, AMX_Q8_0_TRAILER_SIZE);
++}
++
++bool amx_q8_0_grouped_pack(const struct ggml_tensor * t, const void * data, void * trailer) {
++    const int ag_req = g_load_act_group;
++    if (ag_req < 0 || t->type != GGML_TYPE_Q8_0) {
++        return false;
++    }
++    const int K = t->ne[0];
++    const int N = t->ne[1];
++    if (ggml_nrows(t) != N || K % 64 != 0 || N % (2 * TILE_N) != 0) {
++        return false;
++    }
++    const block_q8_0 * B  = (const block_q8_0 *) data;
++    const int          wg = detect_weight_group(B, N, K);
++    if (wg == 0) {
++        return false;
++    }
++    int ag = ag_req == 0 ? K : std::min(ag_req, K);
++    if (ag % 64 != 0 || K % ag != 0 || std::max(ag, wg) % std::min(ag, wg) != 0) {
++        ag = wg;
++    }
++    const int KS  = K / 64;
++    const int KB  = K / QK8_0;
++    const int NGw = K / wg;
++    int8_t *  q   = (int8_t *) t->data;
++    float *   s   = (float *) (q + (size_t) N * K);
++    parallel_for(N / TILE_N, [&](int begin, int end) {
++        for (int nt = begin; nt < end; ++nt) {
++            for (int c = 0; c < TILE_N; ++c) {
++                const block_q8_0 * row = B + (size_t) (nt * TILE_N + c) * KB;
++                for (int g = 0; g < NGw; ++g) {
++                    s[((size_t) nt * NGw + g) * TILE_N + c] = GGML_CPU_FP16_TO_FP32(row[g * (wg / QK8_0)].d);
++                }
++                int8_t * tile = q + (size_t) nt * KS * G_TILE;
++                for (int k = 0; k < K; ++k) {
++                    tile[(size_t) (k / 64) * G_TILE + ((k % 64) / 4) * 64 + c * 4 + k % 4] = row[k / QK8_0].qs[k % QK8_0];
++                }
++            }
++        }
++    });
++    // 128 x the column sums of each scaling group, for the VNNI kernels' unsigned activations
++    const int R    = std::min(wg, ag);
++    const int NR   = K / R;
++    int32_t * wsum = (int32_t *) (s + (size_t) N * NGw);
++    parallel_for(N / TILE_N, [&](int begin, int end) {
++        for (int nt = begin; nt < end; ++nt) {
++            for (int c = 0; c < TILE_N; ++c) {
++                const block_q8_0 * row = B + (size_t) (nt * TILE_N + c) * KB;
++                for (int g = 0; g < NR; ++g) {
++                    int32_t sum = 0;
++                    for (int k = g * R; k < (g + 1) * R; ++k) {
++                        sum += row[k / QK8_0].qs[k % QK8_0];
++                    }
++                    wsum[((size_t) nt * NR + g) * TILE_N + c] = 128 * sum;
++                }
++            }
++        }
++    });
++    amx_q8_0_grouped_info gi = { AMX_Q8_0_GROUPED_MAGIC, K, N, wg, ag };
++    amx_q8_0_grouped_clear(trailer);
++    memcpy(trailer, &gi, sizeof(gi));
++    return true;
++}
++
++const amx_q8_0_grouped_info * amx_q8_0_grouped_get(const struct ggml_tensor * src0, const void * trailer) {
++    const auto * gi = (const amx_q8_0_grouped_info *) trailer;
++    if (gi->magic != AMX_Q8_0_GROUPED_MAGIC || gi->K != src0->ne[0] || gi->N != src0->ne[1]) {
++        return nullptr;
++    }
++    return gi;
++}
++
++size_t amx_q8_0_grouped_wsize(const amx_q8_0_grouped_info & gi, int64_t M) {
++    const int64_t rows = (M + TILE_M - 1) / TILE_M * TILE_M;
++    return (size_t) rows * gi.K + (size_t) rows * (gi.K / gi.ag) * sizeof(float);
++}
++
++void amx_q8_0_grouped_mul_mat(const struct ggml_compute_params * params, const amx_q8_0_grouped_info & gi,
++                              const struct ggml_tensor * src0, const struct ggml_tensor * src1,
++                              struct ggml_tensor * dst, float * out_data, const float * bias) {
++    const int K = gi.K;
++    const int N = gi.N;
++    // the weight is one matrix; activation rows of every batch are rows of one product
++    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
++    GGML_ASSERT(src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && src1->ne[0] == K);
++    GGML_ASSERT(dst->nb[0] == sizeof(float) && dst->nb[1] == (size_t) N * sizeof(float) && ggml_is_contiguous(dst));
++    const int64_t M = ggml_nrows(src1);
++    GGML_ASSERT(M == ggml_nrows(dst) && M <= INT32_MAX);
++    if (params->wsize < amx_q8_0_grouped_wsize(gi, M)) {
++        GGML_ABORT("insufficient work space size");
++    }
++    const group_scales gs(gi);
++    const int          KS   = K / 64;
++    const int          MT   = (int) ((M + TILE_M - 1) / TILE_M);
++    int8_t *           A    = (int8_t *) params->wdata;
++    float *            as   = (float *) (A + (size_t) MT * TILE_M * K);
++    const float *      x    = (const float *) src1->data;
++    const bool         rows16 = M <= TILE_M;
++    // passes of up to GGML_AMX_GROUPED_VNNI_ROWS rows (default AMX_GROUPED_VNNI_ROWS, at most that) on VNNI
++    static const int   vnni_rows = [] {
++        const char * v = getenv("GGML_AMX_GROUPED_VNNI_ROWS");
++        return std::clamp(v != nullptr ? atoi(v) : AMX_GROUPED_VNNI_ROWS, 0, AMX_GROUPED_VNNI_ROWS);
++    }();
++    const bool vnni = M <= vnni_rows;
++
++    // short passes stream the weights from memory: hand their column blocks out dynamically
++    if (rows16 && params->ith == 0) {
++        ggml_threadpool_chunk_set(params->threadpool, params->nth);
++    }
++    if (vnni) {
++        parallel_for_ggml(params, (int) M, [&](int begin, int end) {
++            for (int m = begin; m < end; ++m) {
++                quantize_row<true>(x + (size_t) m * K, A + (size_t) m * K, as + (size_t) m * gs.NGa, K, gi.ag);
++            }
++        });
++    } else parallel_for_ggml(params, MT * TILE_M, [&](int begin, int end) {
++        for (int m = begin; m < end; ++m) {
++            int8_t * a = A + (size_t) (m / TILE_M) * KS * G_TILE + (m % TILE_M) * 64;
++            if (m < M) {
++                quantize_row<false>(x + (size_t) m * K, a, as + (size_t) m * gs.NGa, K, gi.ag);
++            } else {
++                for (int ks = 0; ks < KS; ++ks) {
++                    memset(a + (size_t) ks * G_TILE, 0, 64);
++                }
++                for (int g = 0; g < gs.NGa; ++g) {
++                    as[(size_t) m * gs.NGa + g] = 0.0f;
++                }
++            }
++        }
++    });
++    ggml_barrier(params->threadpool);
++
++    const int8_t * W  = (const int8_t *) src0->data;
++    const float *  Ws = (const float *) (W + (size_t) N * K);
++    if (vnni) {
++        const int32_t * Wsum = (const int32_t *) (Ws + (size_t) N * gs.NGw);
++        const int       NT   = N / TILE_N;
++        const int       NB   = (NT + 3) / 4;
++        for (int i = params->ith; i < NB; i = ggml_threadpool_chunk_add(params->threadpool, 1)) {
++            grouped_vnni_dispatch<AMX_GROUPED_VNNI_ROWS>(gi, gs, (int) M, std::min(4, NT - 4 * i), W, Ws, Wsum,
++                                                         (const uint8_t *) A, as, 4 * i, out_data + (size_t) i * 64, N,
++                                                         bias != nullptr ? bias + (size_t) i * 64 : nullptr);
++        }
++        return;
++    }
++    if (rows16) {
++        const int NT = N / TILE_N;
++        const int NB = (NT + 3) / 4;
++        bool      configured = false;
++        for (int i = params->ith; i < NB; i = ggml_threadpool_chunk_add(params->threadpool, 1)) {
++            if (!configured) {
++                grouped_tile_config();
++                configured = true;
++            }
++            const int nt = std::min(4, NT - 4 * i);
++            grouped_rows16(gi, gs, W, Ws, A, as, (int) M, 4 * i, nt, out_data + (size_t) i * 64, N,
++                           bias != nullptr ? bias + (size_t) i * 64 : nullptr);
++        }
++        return;
++    }
++    parallel_for_ggml(params, N / (2 * TILE_N), [&](int begin, int end) {
++        if (begin < end) {
++            grouped_tile_config();
++        }
++        for (int nb = begin; nb < end; ++nb) {
++            grouped_panel(gi, gs, W, Ws, A, as, (int) M, nb, out_data + (size_t) nb * 2 * TILE_N, N,
++                          bias != nullptr ? bias + (size_t) nb * 2 * TILE_N : nullptr);
++        }
++    });
++}
++
++#endif  // defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+diff --git a/src/ggml-cpu/amx/mmq-grouped.h b/src/ggml-cpu/amx/mmq-grouped.h
+new file mode 100644
+index 0000000..8a24f4a
+--- /dev/null
++++ b/src/ggml-cpu/amx/mmq-grouped.h
+@@ -0,0 +1,49 @@
++#pragma once
++#include "common.h"
++
++// AMX int8 matmul for Q8_0 weights whose blocks share one scale per group of values (opt-in at load time,
++// see ggml_backend_amx_set_q8_0_grouped in amx.h).
++//
++// A Q8_0 tensor converted into the AMX buffer while the opt-in is on, and whose blocks share their scale
++// within every group of G values of a row (G = the whole row, 512, 256, 128 or 64; the largest that holds),
++// is stored in this layout instead of the Q8_0 tiles:
++//   int8 tiles [N / 16][K / 64][16 x 64] (VNNI order: byte ((k % 64) / 4) * 64 + (n % 16) * 4 + k % 4),
++//   then the weight scales as float [N / 16][K / G][16],
++//   then 128 x the column sums of each scaling group (see below) as int32 [N / 16][K / min(G, A)][16].
++// Activations are quantized to int8 per row with one scale per group of A values (A = the whole row, or a
++// group size given with the opt-in), and the int32 sums are scaled once per min(G, A) values instead of once
++// per 32: with AMX tiles of 16 x 16 x 64 for more than 8 rows, with AVX512-VNNI (and column sums made at
++// load) for up to 8. A trailer after the standard packed size records the layout; every other tensor gets
++// an empty trailer and keeps the standard kernels.
++
++#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
++
++struct amx_q8_0_grouped_info {
++    uint64_t magic;
++    int32_t  K, N;
++    int32_t  wg;  // values per weight scale
++    int32_t  ag;  // values per activation scale
++};
++
++// bytes after the standard packed Q8_0 data that every Q8_0 tensor in the AMX buffer gets
++constexpr size_t AMX_Q8_0_TRAILER_SIZE = 64;
++
++// set the trailer of a tensor packed the standard way
++void amx_q8_0_grouped_clear(void * trailer);
++
++// pack `data` (Q8_0 blocks of tensor t) in the grouped layout at t->data if the opt-in is on and the blocks
++// share their scales per group; writes the trailer and returns true, or returns false (nothing written)
++bool amx_q8_0_grouped_pack(const struct ggml_tensor * t, const void * data, void * trailer);
++
++// the layout of a weight in the AMX buffer, or nullptr if it is not grouped; trailer: its trailer
++const amx_q8_0_grouped_info * amx_q8_0_grouped_get(const struct ggml_tensor * src0, const void * trailer);
++
++// work space of a grouped mul_mat with M activation rows
++size_t amx_q8_0_grouped_wsize(const amx_q8_0_grouped_info & gi, int64_t M);
++
++// dst (or out_data, with the bias row added) = src1 @ src0^T for a grouped weight
++void amx_q8_0_grouped_mul_mat(const struct ggml_compute_params * params, const amx_q8_0_grouped_info & gi,
++                              const struct ggml_tensor * src0, const struct ggml_tensor * src1,
++                              struct ggml_tensor * dst, float * out_data, const float * bias);
++
++#endif
+diff --git a/src/ggml-cpu/amx/mmq.cpp b/src/ggml-cpu/amx/mmq.cpp
+index dfa4b2b..6b079dd 100644
+--- a/src/ggml-cpu/amx/mmq.cpp
++++ b/src/ggml-cpu/amx/mmq.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "amx.h"
+ #include "mmq.h"
++#include "mmq-grouped.h"
+ #include "ggml-impl.h"
+ #include "ggml-cpu-impl.h"
+ #include "simd-mappings.h"
+@@ -157,15 +158,6 @@ struct is_type_qkk : std::integral_constant<bool,
+         }                                                                              \
+     }()
+ 
+-// define amx tile config data structure
+-struct tile_config_t{
+-    uint8_t palette_id = 0;
+-    uint8_t start_row = 0;
+-    uint8_t reserved_0[14] = {0};
+-    uint16_t colsb[16] = {0};
+-    uint8_t rows[16] = {0};
+-};
+-
+ // Notes: amx tile config
+ //
+ // Typically, TMUL calculates A and B of size 16 x 64 containing INT8 values,
+@@ -203,9 +195,7 @@ struct tile_config_t{
+ //
+ 
+ inline void ggml_tile_config_init(void) {
+-    static thread_local bool done = false;
+-
+-    if (done) {
++    if (ggml_amx_tile_config_id == AMX_TILE_CONFIG_Q) {
+         return;
+     }
+ 
+@@ -222,7 +212,7 @@ inline void ggml_tile_config_init(void) {
+     tc.rows[7] = 16;  tc.colsb[7] = 64;
+ 
+     _tile_loadconfig(&tc);
+-    done = true;
++    ggml_amx_tile_config_id = AMX_TILE_CONFIG_Q;
+ }
+ 
+ // we need an extra 16 * 4B (TILE_N * int32_t) for each NB/KB block for compensation.
+@@ -2264,6 +2254,19 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
+ 
+ } // anonymous namespace
+ 
++// bytes of a Q8_0 weight packed in the standard layout (its trailer follows)
++size_t amx_q8_0_packed_size(int64_t N, int64_t K) {
++    return (size_t) N * get_row_size<block_q8_0, QK8_0>(K);
++}
++
++// the grouped layout of a Q8_0 weight in the AMX buffer, or nullptr
++static const amx_q8_0_grouped_info * amx_q8_0_grouped_of(const struct ggml_tensor * src0) {
++    if (src0->type != GGML_TYPE_Q8_0) {
++        return nullptr;
++    }
++    return amx_q8_0_grouped_get(src0, (const char *) src0->data + amx_q8_0_packed_size(src0->ne[1], src0->ne[0]));
++}
++
+ // get the packed tensor size for quantized weights
+ size_t ggml_backend_amx_get_alloc_size(const struct ggml_tensor * tensor) {
+     const enum ggml_type TYPE = tensor->type;
+@@ -2280,7 +2283,8 @@ size_t ggml_backend_amx_get_alloc_size(const struct ggml_tensor * tensor) {
+     };
+ 
+     if (qtype_has_amx_kernels(TYPE)) {
+-        return get_tensor_size();
++        // Q8_0 also gets a trailer that says whether it is in the grouped layout (mmq-grouped.h)
++        return get_tensor_size() + (TYPE == GGML_TYPE_Q8_0 ? AMX_Q8_0_TRAILER_SIZE : 0);
+     } else {
+         // for f16, bf16 we don't do packing
+         return ggml_nbytes(tensor);
+@@ -2296,6 +2300,13 @@ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * d
+     const int K = tensor->ne[0]; // ne0: in_features
+     const int N = tensor->ne[1]; // ne1: out_features
+ 
++    if (TYPE == GGML_TYPE_Q8_0) {
++        void * trailer = (char *) tensor->data + amx_q8_0_packed_size(N, K);
++        if (amx_q8_0_grouped_pack(tensor, data, trailer)) {
++            return;
++        }
++        amx_q8_0_grouped_clear(trailer);
++    }
+     GGML_DISPATCH_QTYPES(TYPE, [&] {
+         convert_B_packed_format<type, blck_size>((void *)((char *)tensor->data + offset), (const type *)data, N, K);
+     });
+@@ -2554,6 +2565,9 @@ size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst) {
+     if (TYPE == GGML_TYPE_Q8_0 && M > 1) {
+         desired_wsize = std::max(desired_wsize, n_batch * amx_q8_0_packed_a_size(M, K));
+     }
++    if (const amx_q8_0_grouped_info * gi = amx_q8_0_grouped_of(src0)) {
++        desired_wsize = std::max(desired_wsize, amx_q8_0_grouped_wsize(*gi, ggml_nrows(dst)));
++    }
+ 
+     return desired_wsize;
+ }
+@@ -2588,6 +2602,11 @@ static void amx_mul_mat_impl(const ggml_compute_params * params, struct ggml_ten
+     const int64_t ne2 = dst->ne[2];
+     const int64_t n_batch = ne2 * dst->ne[3];
+ 
++    if (const amx_q8_0_grouped_info * gi = amx_q8_0_grouped_of(src0)) {
++        amx_q8_0_grouped_mul_mat(params, *gi, src0, src1, dst, out_data, bias);
++        return;
++    }
++
+     if (is_floating_type) {
+         constexpr int BLOCK_M = 4;
+         constexpr int BLOCK_N = 6;
+@@ -2765,7 +2784,8 @@ bool ggml_backend_amx_mul_mat_add(const ggml_compute_params * params, struct ggm
+     const ggml_tensor * src0 = mm->src[0];
+     const ggml_tensor * bias = add->src[0] == mm ? add->src[1] : add->src[0];
+     const int           M    = mm->ne[1];
+-    if (src0->type != GGML_TYPE_Q8_0 || mm->ne[2] * mm->ne[3] != 1 || !(M == 1 || amx_q8_0_use_new(src0, M)) ||
++    if (src0->type != GGML_TYPE_Q8_0 || mm->ne[2] * mm->ne[3] != 1 ||
++        !(M == 1 || amx_q8_0_use_new(src0, M) || amx_q8_0_grouped_of(src0) != nullptr) ||
+         bias->type != GGML_TYPE_F32 || ggml_nrows(bias) != 1 || bias->ne[0] != mm->ne[0] ||
+         bias->nb[0] != sizeof(float) || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
+         !ggml_is_contiguous(mm)) {
+diff --git a/src/ggml-cpu/amx/mmq.h b/src/ggml-cpu/amx/mmq.h
+index 19bd436..2ce204a 100644
+--- a/src/ggml-cpu/amx/mmq.h
++++ b/src/ggml-cpu/amx/mmq.h
+@@ -5,6 +5,9 @@ size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst);
+ 
+ size_t ggml_backend_amx_get_alloc_size(const struct ggml_tensor * tensor);
+ 
++// bytes of a Q8_0 weight packed in the standard layout
++size_t amx_q8_0_packed_size(int64_t N, int64_t K);
++
+ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+ 
+ void ggml_backend_amx_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/src/ggml-cpu/ggml-cpu.cpp b/src/ggml-cpu/ggml-cpu.cpp
+index 8585097..a65742d 100644
+--- a/src/ggml-cpu/ggml-cpu.cpp
++++ b/src/ggml-cpu/ggml-cpu.cpp
+@@ -710,6 +710,11 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
+     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
+         return (void *)ggml_backend_cpu_set_use_ref;
+     }
++#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
++    if (strcmp(name, "ggml_backend_cpu_amx_set_q8_0_grouped") == 0) {
++        return (void *)ggml_backend_amx_set_q8_0_grouped;
++    }
++#endif
+ 
+     // threadpool - TODO:  move to ggml-base
+     if (strcmp(name, "ggml_threadpool_new") == 0) {

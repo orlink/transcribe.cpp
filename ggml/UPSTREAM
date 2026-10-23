@@ -12,6 +12,7 @@ patches:
   patches/ggml/0009-cpu-amx-dynamic-single-row.patch
   patches/ggml/0010-cpu-fuse-norm-mul-add.patch
   patches/ggml/0011-cpu-amx-fuse-bias-add.patch
+  patches/ggml/0012-cpu-amx-q8_0-grouped-scales.patch
 
 This directory is generated from the upstream ggml tree at the SHA above, minus
 .github/, with the listed downstream patches applied in order. Do not edit it by

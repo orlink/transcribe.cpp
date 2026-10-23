@@ -5,6 +5,7 @@
 
 #include "amx.h"
 #include "mmq.h"
+#include "mmq-grouped.h"
 #include "ggml-impl.h"
 #include "ggml-cpu-impl.h"
 #include "simd-mappings.h"
@@ -157,15 +158,6 @@ struct is_type_qkk : std::integral_constant<bool,
         }                                                                              \
     }()
 
-// define amx tile config data structure
-struct tile_config_t{
-    uint8_t palette_id = 0;
-    uint8_t start_row = 0;
-    uint8_t reserved_0[14] = {0};
-    uint16_t colsb[16] = {0};
-    uint8_t rows[16] = {0};
-};
-
 // Notes: amx tile config
 //
 // Typically, TMUL calculates A and B of size 16 x 64 containing INT8 values,
@@ -203,9 +195,7 @@ struct tile_config_t{
 //
 
 inline void ggml_tile_config_init(void) {
-    static thread_local bool done = false;
-
-    if (done) {
+    if (ggml_amx_tile_config_id == AMX_TILE_CONFIG_Q) {
         return;
     }
 
@@ -222,7 +212,7 @@ inline void ggml_tile_config_init(void) {
     tc.rows[7] = 16;  tc.colsb[7] = 64;
 
     _tile_loadconfig(&tc);
-    done = true;
+    ggml_amx_tile_config_id = AMX_TILE_CONFIG_Q;
 }
 
 // we need an extra 16 * 4B (TILE_N * int32_t) for each NB/KB block for compensation.
@@ -2264,6 +2254,19 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
 
 } // anonymous namespace
 
+// bytes of a Q8_0 weight packed in the standard layout (its trailer follows)
+size_t amx_q8_0_packed_size(int64_t N, int64_t K) {
+    return (size_t) N * get_row_size<block_q8_0, QK8_0>(K);
+}
+
+// the grouped layout of a Q8_0 weight in the AMX buffer, or nullptr
+static const amx_q8_0_grouped_info * amx_q8_0_grouped_of(const struct ggml_tensor * src0) {
+    if (src0->type != GGML_TYPE_Q8_0) {
+        return nullptr;
+    }
+    return amx_q8_0_grouped_get(src0, (const char *) src0->data + amx_q8_0_packed_size(src0->ne[1], src0->ne[0]));
+}
+
 // get the packed tensor size for quantized weights
 size_t ggml_backend_amx_get_alloc_size(const struct ggml_tensor * tensor) {
     const enum ggml_type TYPE = tensor->type;
@@ -2280,7 +2283,8 @@ size_t ggml_backend_amx_get_alloc_size(const struct ggml_tensor * tensor) {
     };
 
     if (qtype_has_amx_kernels(TYPE)) {
-        return get_tensor_size();
+        // Q8_0 also gets a trailer that says whether it is in the grouped layout (mmq-grouped.h)
+        return get_tensor_size() + (TYPE == GGML_TYPE_Q8_0 ? AMX_Q8_0_TRAILER_SIZE : 0);
     } else {
         // for f16, bf16 we don't do packing
         return ggml_nbytes(tensor);
@@ -2296,6 +2300,13 @@ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * d
     const int K = tensor->ne[0]; // ne0: in_features
     const int N = tensor->ne[1]; // ne1: out_features
 
+    if (TYPE == GGML_TYPE_Q8_0) {
+        void * trailer = (char *) tensor->data + amx_q8_0_packed_size(N, K);
+        if (amx_q8_0_grouped_pack(tensor, data, trailer)) {
+            return;
+        }
+        amx_q8_0_grouped_clear(trailer);
+    }
     GGML_DISPATCH_QTYPES(TYPE, [&] {
         convert_B_packed_format<type, blck_size>((void *)((char *)tensor->data + offset), (const type *)data, N, K);
     });
@@ -2554,6 +2565,9 @@ size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst) {
     if (TYPE == GGML_TYPE_Q8_0 && M > 1) {
         desired_wsize = std::max(desired_wsize, n_batch * amx_q8_0_packed_a_size(M, K));
     }
+    if (const amx_q8_0_grouped_info * gi = amx_q8_0_grouped_of(src0)) {
+        desired_wsize = std::max(desired_wsize, amx_q8_0_grouped_wsize(*gi, ggml_nrows(dst)));
+    }
 
     return desired_wsize;
 }
@@ -2587,6 +2601,11 @@ static void amx_mul_mat_impl(const ggml_compute_params * params, struct ggml_ten
 
     const int64_t ne2 = dst->ne[2];
     const int64_t n_batch = ne2 * dst->ne[3];
+
+    if (const amx_q8_0_grouped_info * gi = amx_q8_0_grouped_of(src0)) {
+        amx_q8_0_grouped_mul_mat(params, *gi, src0, src1, dst, out_data, bias);
+        return;
+    }
 
     if (is_floating_type) {
         constexpr int BLOCK_M = 4;
@@ -2765,7 +2784,8 @@ bool ggml_backend_amx_mul_mat_add(const ggml_compute_params * params, struct ggm
     const ggml_tensor * src0 = mm->src[0];
     const ggml_tensor * bias = add->src[0] == mm ? add->src[1] : add->src[0];
     const int           M    = mm->ne[1];
-    if (src0->type != GGML_TYPE_Q8_0 || mm->ne[2] * mm->ne[3] != 1 || !(M == 1 || amx_q8_0_use_new(src0, M)) ||
+    if (src0->type != GGML_TYPE_Q8_0 || mm->ne[2] * mm->ne[3] != 1 ||
+        !(M == 1 || amx_q8_0_use_new(src0, M) || amx_q8_0_grouped_of(src0) != nullptr) ||
         bias->type != GGML_TYPE_F32 || ggml_nrows(bias) != 1 || bias->ne[0] != mm->ne[0] ||
         bias->nb[0] != sizeof(float) || add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
         !ggml_is_contiguous(mm)) {
