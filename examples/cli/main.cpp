@@ -51,6 +51,8 @@ void print_usage(const char * argv0) {
                  "  --vocabulary-file P   custom terms, one per line\n"
                  "  --prompt TEXT         context text, or the instruction for --task instruct\n"
                  "  --prefix TEXT         transcript text the model continues from\n"
+                 "  --draft-text TEXT     text close to the expected transcript (Canary); the\n"
+                 "                        decoder checks it in batches (same output, fewer passes)\n"
                  "  --target-language ISO target language for translation (e.g. de, es, fr)\n"
                  "  -q, --quiet           suppress library log output\n"
                  "  -r, --repeat N        run N times per file (benchmark)\n"
@@ -258,6 +260,12 @@ bool parse_args(int argc, char ** argv, cli_args & out) {
                 return false;
             }
             out.prefix = v;
+        } else if (a == "--draft-text") {
+            const char * v = take_value(a.c_str());
+            if (!v) {
+                return false;
+            }
+            out.draft = v;
         } else if (a == "-q" || a == "--quiet") {
             out.quiet = true;
         } else if (a == "-r" || a == "--repeat") {

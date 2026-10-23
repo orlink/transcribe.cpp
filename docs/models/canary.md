@@ -95,10 +95,18 @@ ext.draft = first_pass_text;
 run_params.family = &ext.ext;
 ```
 
-On the CPU backend the decoder then appends up to `draft_max` (default 8)
-draft tokens to each decoder pass and keeps those that equal its own greedy
-choice. The transcript is the same as without a draft; only the number of
-decoder passes drops. On dictation clips with the text of a separate
-streaming recognizer as the draft, decoding took about 40% less time. The
-draft is ignored on other backends and for inputs of 512 or more encoder
-frames (about 41 s).
+On the CPU backend the decoder then appends draft tokens to each decoder
+pass and keeps those that equal its own greedy choice. A pass has at most
+`draft_max + 1` rows (default 16): the prompt pass carries the first draft
+tokens behind the prompt, and each later pass the last token and up to 15
+draft tokens. After a difference (added punctuation, a dropped filler word)
+the decoder takes one-token steps until a token it emits is found in the
+draft again: within three tokens before or four after the expected place,
+or anywhere when the last two emitted tokens match there too.
+
+The transcript is the same as without a draft; only the number of decoder
+passes drops. On dictation clips with the text of a separate streaming
+recognizer as the draft, decoding took about 45% less time; a draft that
+never matches made it about 3% slower. The draft is ignored on other
+backends, without flash attention, and for inputs of 512 or more encoder
+frames (about 41 s). The CLI takes it with `--draft-text TEXT`.

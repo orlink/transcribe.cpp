@@ -28,17 +28,21 @@ extern "C" {
  *   draft
  *
  *     Expected transcript of the audio, for example the text of a first
- *     recognition pass. The decoder appends up to draft_max of its tokens to
- *     each decoder pass and keeps those that equal its own greedy choice, so
- *     the transcript is the same as without a draft; a draft close to the
- *     result only makes decoding faster. NULL or "" decodes one token per
- *     pass. The text is copied before transcribe_run returns. Used on the CPU
- *     backend for inputs under about 40 s, where the checked tokens take the
- *     same kernels as one-token steps; ignored elsewhere.
+ *     recognition pass. The decoder appends draft tokens to each decoder
+ *     pass, the prompt pass included, and keeps those that equal its own
+ *     greedy choice, so the transcript is the same as without a draft; a
+ *     draft close to the result only makes decoding faster. After a
+ *     difference the decoder finds its place in the draft again from the
+ *     tokens it emits. NULL or "" decodes one token per pass. The text is
+ *     copied before transcribe_run returns. Used on the CPU backend with
+ *     flash attention for inputs under about 40 s, where the checked tokens
+ *     take the same kernels as one-token steps; ignored elsewhere.
  *
  *   draft_max
  *
- *     Draft tokens checked per decoder pass, 1..32; <= 0 selects 8.
+ *     Rows per decoder pass minus one, 1..32; <= 0 selects 15. A pass after
+ *     the prompt pass checks up to draft_max draft tokens; the prompt pass
+ *     checks up to draft_max + 1 minus the prompt length.
  */
 struct transcribe_canary_run_ext {
     struct transcribe_ext ext;
