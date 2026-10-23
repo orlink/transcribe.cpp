@@ -17,6 +17,7 @@ patches:
   patches/ggml/0014-cpu-direct-pre-encode-convs.patch
   patches/ggml/0015-cpu-fused-conv-module.patch
   patches/ggml/0016-cpu-norm-row-sums-x16.patch
+  patches/ggml/0017-cpu-rel-pos-scores.patch
 
 This directory is generated from the upstream ggml tree at the SHA above, minus
 .github/, with the listed downstream patches applied in order. Do not edit it by

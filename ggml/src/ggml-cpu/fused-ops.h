@@ -37,6 +37,13 @@ ggml_custom_op_t ggml_cpu_conv_1d_dw_bn_silu_op(const struct ggml_tensor * x, co
                                                 const struct ggml_tensor * b, const struct ggml_tensor * scale,
                                                 const struct ggml_tensor * shift, int pad);
 
+// Relative-position scores of conformer attention as the flash-attention mask: q [D, T, H, 1] and p [D, 2T - 1, H, 1]
+// f32 (rows contiguous, any other strides), mask[h][i][j] = f16(scale * dot(q[h][i], p[h][T - 1 - i + j])):
+// [T, T, H, 1] f16. Reproduces ggml_mul_mat(p, q) (one ggml_vec_dot_f32 per score), the relative shift and its
+// copy, ggml_scale and the cast to f16, computing only the T x T scores kept of the 2T - 1 x T. The custom op's
+// userdata holds the bits of scale.
+ggml_custom_op_t ggml_cpu_rel_pos_scores_f16_op(const struct ggml_tensor * q, const struct ggml_tensor * p);
+
 #ifdef __cplusplus
 }
 #endif

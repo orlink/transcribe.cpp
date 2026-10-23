@@ -9,6 +9,7 @@
 //     bit for bit to the generic ops they replace, for inputs spanning six orders of magnitude, several shapes
 //     and paddings. Skipped where the backend returns no kernel.
 //   - Layer norm fused by the CPU backend (NORM + MUL + ADD) against the unfused nodes, for 1-133 rows.
+//   - The relative-position scores kernel against matmul, shift, scale and f16 cast, for 1-133 frames.
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -430,6 +431,71 @@ void test_norm_mul_add(ggml_backend_t cpu) {
     }
 }
 
+// relative-position scores of conformer flash attention: ggml_mul_mat(p, q) over the 2T - 1 positions, the
+// relative shift (a view and its copy), ggml_scale and the cast to the f16 mask
+void test_rel_pos_scores(ggml_backend_t cpu) {
+    using Getter           = ggml_custom_op_t (*)(const ggml_tensor *, const ggml_tensor *);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu));
+    const Getter       get =
+        reinterpret_cast<Getter>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_rel_pos_scores_f16_op"));
+    if (get == nullptr) {
+        std::printf("rel_pos_scores: no kernel, skipped\n");
+        return;
+    }
+    std::mt19937 rng(29);
+    const float  scale = 1.0f / std::sqrt(128.0f);
+    uint32_t     bits  = 0;
+    std::memcpy(&bits, &scale, sizeof(bits));
+    for (const int64_t D : { 128, 64 }) {
+        for (const int64_t T : { 1, 7, 25, 62, 133 }) {
+            const int64_t H = 4;
+            const int64_t P = 2 * T - 1;
+            // as the attention has them before its permutes: [D, H, T] and [D, H, P]
+            const Input   q{
+                { D, H, T },
+                wide_values(rng, D * H * T)
+            };
+            const Input p{
+                { D, H, P },
+                wide_values(rng, D * H * P)
+            };
+            std::vector<float> res[2];
+            ggml_custom_op_t   op = nullptr;
+            for (int fused = 0; fused < 2; ++fused) {
+                res[fused] = run_graph(cpu, { q, p }, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+                    ggml_tensor * qp = ggml_permute(ctx, t[0], 0, 2, 1, 3);
+                    ggml_tensor * pp = ggml_permute(ctx, t[1], 0, 2, 1, 3);
+                    ggml_tensor * m  = nullptr;
+                    if (fused) {
+                        op = get(qp, pp);
+                        if (op == nullptr) {
+                            return ggml_cont(ctx, t[0]);
+                        }
+                        ggml_tensor * args[2] = { qp, pp };
+                        m = ggml_custom_4d(ctx, GGML_TYPE_F16, T, T, H, 1, args, 2, op, GGML_N_TASKS_MAX,
+                                           reinterpret_cast<void *>(static_cast<uintptr_t>(bits)));
+                    } else {
+                        m               = ggml_mul_mat(ctx, ggml_cont(ctx, pp), ggml_cont(ctx, qp));  // [P, T, H]
+                        const size_t qs = T == 1 ? static_cast<size_t>(T) * m->nb[0] : m->nb[1] - m->nb[0];
+                        m               = ggml_view_4d(ctx, m, T, T, H, 1, qs, m->nb[2], m->nb[3], (T - 1) * m->nb[0]);
+                        m               = ggml_cont(ctx, m);
+                        m               = ggml_scale(ctx, m, scale);
+                        m               = ggml_cast(ctx, m, GGML_TYPE_F16);
+                    }
+                    return ggml_cast(ctx, m, GGML_TYPE_F32);
+                });
+            }
+            CHECK(op != nullptr);
+            const int64_t bad = count_differ(res[0], res[1]);
+            if (bad != 0) {
+                std::fprintf(stderr, "rel_pos_scores D=%lld T=%lld: %lld differ\n", (long long) D, (long long) T,
+                             (long long) bad);
+            }
+            CHECK(bad == 0);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -446,6 +512,7 @@ int main() {
     test_conv_2d_pw(cpu);
     test_conv_1d_dw_bn_silu(cpu);
     test_norm_mul_add(cpu);
+    test_rel_pos_scores(cpu);
 
     ggml_backend_free(cpu);
     if (g_failures != 0) {

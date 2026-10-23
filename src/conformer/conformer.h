@@ -131,8 +131,8 @@ struct ConvPolicy {
     bool pre_encode_f32_pointwise = false;
 
     // On a CPU primary, run parts of the graph through the CPU backend's direct kernels (ggml-cpu/fused-ops.h),
-    // which give the same results as the ops they replace: the pre_encode convs, and the conv module
-    // from the depthwise conv to SiLU.
+    // which give the same results as the ops they replace: the pre_encode convs, the conv module from the
+    // depthwise conv to SiLU, and the relative-position scores of flash attention.
     bool cpu_fused_ops = false;
 };
 

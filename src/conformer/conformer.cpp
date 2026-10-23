@@ -845,8 +845,9 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
     // data via strides, so contiguous materialization (cont) is not
     // required for q_u/k/v. q_v and p still need cont because they feed
     // into mul_mat for the position score computation.
-    q_u = ggml_permute(ctx, q_u, 0, 2, 1, 3);
-    q_v = ggml_cont(ctx, ggml_permute(ctx, q_v, 0, 2, 1, 3));
+    q_u                    = ggml_permute(ctx, q_u, 0, 2, 1, 3);
+    ggml_tensor * q_v_perm = ggml_permute(ctx, q_v, 0, 2, 1, 3);
+    q_v                    = ggml_cont(ctx, q_v_perm);
 
     k = ggml_reshape_4d(ctx, k, head_dim, n_head, T_kv, B);
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
@@ -857,9 +858,11 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
     // Position scores are batch-independent (pos_emb has no batch axis), so
     // p keeps ne[3] == 1 and broadcasts across the batch in the mul_mat.
     // The precomputed pos_proj is exactly this tensor, memoized.
+    ggml_tensor * p_perm = pos_proj;
     if (p != nullptr) {
-        p = ggml_reshape_4d(ctx, p, head_dim, n_head, pos_len, 1);
-        p = ggml_cont(ctx, ggml_permute(ctx, p, 0, 2, 1, 3));
+        p      = ggml_reshape_4d(ctx, p, head_dim, n_head, pos_len, 1);
+        p_perm = ggml_permute(ctx, p, 0, 2, 1, 3);
+        p      = ggml_cont(ctx, p_perm);
     } else {
         p = pos_proj;
     }
@@ -888,7 +891,28 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
     const bool       split_flash_mask =
         flash && !is_local && !is_chunked && params.attn_pad_mask == nullptr && mask_f32_bytes > kSplitMaskBytes;
     ggml_tensor * matrix_bd = nullptr;
-    if (split_flash_mask) {
+    // On CPU, the scaled f16 flash mask straight from q_v and p in one kernel (only the T_kv x T_q scores kept).
+    bool          bd_fused  = false;
+    if (flash && params.policy.cpu_fused_ops && !split_flash_mask && !is_local && !is_chunked &&
+        params.attn_pad_mask == nullptr && B == 1 && T_kv == T_q) {
+        using Getter           = ggml_custom_op_t (*)(const ggml_tensor *, const ggml_tensor *);
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+        const Getter       get = reg != nullptr ? reinterpret_cast<Getter>(ggml_backend_reg_get_proc_address(
+                                                      reg, "ggml_backend_cpu_rel_pos_scores_f16_op")) :
+                                                  nullptr;
+        ggml_custom_op_t   op  = get != nullptr ? get(q_v_perm, p_perm) : nullptr;
+        if (op != nullptr) {
+            uint32_t scale_bits = 0;
+            std::memcpy(&scale_bits, &scale, sizeof(scale_bits));
+            ggml_tensor * args[2] = { q_v_perm, p_perm };
+            matrix_bd = ggml_custom_4d(ctx, GGML_TYPE_F16, T_kv, T_q, n_head, 1, args, 2, op, GGML_N_TASKS_MAX,
+                                       reinterpret_cast<void *>(static_cast<uintptr_t>(scale_bits)));
+            bd_fused  = true;
+        }
+    }
+    if (bd_fused) {
+        // matrix_bd is the finished mask
+    } else if (split_flash_mask) {
         for (int h = 0; h < n_head; ++h) {
             ggml_tensor * p_h       = ggml_view_4d(ctx, p, head_dim, pos_len, 1, 1, p->nb[1], p->nb[2], p->nb[3],
                                                    static_cast<size_t>(h) * p->nb[2]);
@@ -955,7 +979,7 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
     ggml_tensor * o;
 
     if (flash) {
-        if (!split_flash_mask) {
+        if (!split_flash_mask && !bd_fused) {
             matrix_bd = ggml_scale(ctx, matrix_bd, scale);
             matrix_bd = ggml_cast(ctx, matrix_bd, GGML_TYPE_F16);
         }

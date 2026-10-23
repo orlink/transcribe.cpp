@@ -486,6 +486,125 @@ void conv_1d_dw_bn_silu(ggml_tensor * dst, int ith, int nth, void * userdata) {
 
 #endif  // __AVX512DQ__
 
+#if defined(__AVX512BW__) && defined(__AVX512VL__)
+
+// ggml_vec_dot_f32 of length D, a multiple of 64, in GCC's AVX-512 build: four vector accumulators taking the
+// products of 16-value blocks j, j + 4, j + 8, ... by FMA (from zero), combined as (a0 + a2) + (a1 + a3), then
+// _mm512_reduce_add_ps. dot_lanes returns the combined vector before that last reduction.
+inline __m512 dot_lanes(const float * x, const __m512 * y, int64_t D) {
+    __m512 a[4] = { _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps(), _mm512_setzero_ps() };
+    for (int64_t i = 0; i < D; i += 64) {
+        for (int j = 0; j < 4; ++j) {
+            a[j] = _mm512_fmadd_ps(_mm512_loadu_ps(x + i + 16 * j), y[i / 16 + j], a[j]);
+        }
+    }
+    return _mm512_add_ps(_mm512_add_ps(a[0], a[2]), _mm512_add_ps(a[1], a[3]));
+}
+
+// _mm512_reduce_add_ps of 16 vectors at once, lane o of the result being the reduction of u[o], with GCC's tree
+// for each: t3[i] = u[8 + i] + u[i], t6[i] = t3[4 + i] + t3[i], (t6[0] + t6[2]) + (t6[1] + t6[3]).
+inline __m512 reduce_add_x16(const __m512 * u) {
+    __m512 w[8];
+    for (int k = 0; k < 8; ++k) {  // 8 + 8 lanes: t3 of u[2k], u[2k + 1]
+        w[k] = _mm512_add_ps(_mm512_shuffle_f32x4(u[2 * k], u[2 * k + 1], 0xee),
+                             _mm512_shuffle_f32x4(u[2 * k], u[2 * k + 1], 0x44));
+    }
+    __m512 z[4];
+    for (int k = 0; k < 4; ++k) {  // 4 x 4 lanes: t6 of u[4k] .. u[4k + 3]
+        z[k] = _mm512_add_ps(_mm512_shuffle_f32x4(w[2 * k], w[2 * k + 1], 0xdd),
+                             _mm512_shuffle_f32x4(w[2 * k], w[2 * k + 1], 0x88));
+    }
+    __m512 v[2];
+    for (int k = 0; k < 2; ++k) {  // per 128-bit lane L: t6[0] + t6[2], t6[1] + t6[3] of z[2k] and z[2k + 1] lane L
+        v[k] = _mm512_add_ps(_mm512_shuffle_ps(z[2 * k], z[2 * k + 1], 0x44), _mm512_shuffle_ps(z[2 * k], z[2 * k + 1], 0xee));
+    }
+    // lane 4L + s: the result of u[4s + L]; reorder to lane o = u[o]
+    const __m512  r   = _mm512_add_ps(_mm512_shuffle_ps(v[0], v[1], 0x88), _mm512_shuffle_ps(v[0], v[1], 0xdd));
+    const __m512i idx = _mm512_setr_epi32(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    return _mm512_permutexvar_ps(idx, r);
+}
+
+// Whether ggml_vec_dot_f32 of length D sums as dot_lanes + _mm512_reduce_add_ps, and reduce_add_x16 reduces as
+// _mm512_reduce_add_ps, on random values spanning many magnitudes
+bool vec_dot_rows_match(int64_t D) {
+    std::mt19937                          rng(3);
+    std::normal_distribution<float>       nd(0.0f, 1.0f);
+    std::uniform_real_distribution<float> ue(-4.0f, 4.0f);
+    std::vector<float>                    x(16 * D), y(D);
+    for (int t = 0; t < 64; ++t) {
+        for (float & v : x) {
+            v = nd(rng) * powf(10.0f, ue(rng));
+        }
+        for (float & v : y) {
+            v = nd(rng) * powf(10.0f, ue(rng));
+        }
+        std::vector<__m512> yv(D / 16);
+        for (int64_t i = 0; i < D / 16; ++i) {
+            yv[i] = _mm512_loadu_ps(y.data() + 16 * i);
+        }
+        __m512 u[16];
+        for (int o = 0; o < 16; ++o) {
+            u[o] = dot_lanes(x.data() + o * D, yv.data(), D);
+        }
+        float got[16];
+        _mm512_storeu_ps(got, reduce_add_x16(u));
+        for (int o = 0; o < 16; ++o) {
+            float       ref = 0.0f;
+            const float one = _mm512_reduce_add_ps(u[o]);
+            ggml_vec_dot_f32((int) D, &ref, 0, x.data() + o * D, 0, y.data(), 0, 1);
+            if (memcmp(&ref, &got[o], sizeof(float)) != 0 || memcmp(&ref, &one, sizeof(float)) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void rel_pos_scores_f16(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * p = dst->src[1];
+    float               scale;
+    const uint32_t      bits = (uint32_t) (uintptr_t) userdata;
+    memcpy(&scale, &bits, sizeof(float));
+
+    const int64_t D = q->ne[0];
+    const int64_t T = q->ne[1];
+    const int64_t H = q->ne[2];
+
+    const __m512 sv     = _mm512_set1_ps(scale);
+    const int64_t n_row = H * T;
+    const int64_t r0    = n_row * ith / nth;
+    const int64_t r1    = n_row * (ith + 1) / nth;
+    __m512        yv[64];  // D <= 1024
+    for (int64_t r = r0; r < r1; ++r) {
+        const int64_t h  = r / T;
+        const int64_t i  = r % T;
+        const float * qr = (const float *) ((const char *) q->data + i * q->nb[1] + h * q->nb[2]);
+        for (int64_t k = 0; k < D / 16; ++k) {
+            yv[k] = _mm512_loadu_ps(qr + 16 * k);
+        }
+        const char *  pb  = (const char *) p->data + h * p->nb[2] + (T - 1 - i) * p->nb[1];
+        ggml_fp16_t * out = (ggml_fp16_t *) ((char *) dst->data + i * dst->nb[1] + h * dst->nb[2]);
+        for (int64_t j0 = 0; j0 < T; j0 += 16) {
+            const int64_t nj = std::min<int64_t>(16, T - j0);
+            __m512        u[16];
+            for (int64_t o = 0; o < 16; ++o) {
+                u[o] = o < nj ? dot_lanes((const float *) (pb + (j0 + o) * p->nb[1]), yv, D) : _mm512_setzero_ps();
+            }
+            const __m512  sc = _mm512_mul_ps(reduce_add_x16(u), sv);
+            const __m256i h16 = _mm512_cvtps_ph(sc, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            if (nj == 16) {
+                _mm256_storeu_si256((__m256i *) (out + j0), h16);
+            } else {
+                _mm256_mask_storeu_epi16(out + j0, (__mmask16) ((1u << nj) - 1), h16);
+            }
+        }
+    }
+}
+
+
+#endif  // __AVX512BW__ && __AVX512VL__
+
 #endif  // GGML_CONV_FUSED_AVX512
 
 }  // namespace
@@ -571,6 +690,28 @@ extern "C" ggml_custom_op_t ggml_cpu_conv_1d_dw_bn_silu_op(const ggml_tensor * x
     (void) scale;
     (void) shift;
     (void) pad;
+    return nullptr;
+#endif
+}
+
+extern "C" ggml_custom_op_t ggml_cpu_rel_pos_scores_f16_op(const ggml_tensor * q, const ggml_tensor * p) {
+#if defined(GGML_CONV_FUSED_AVX512) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    if (q == nullptr || p == nullptr || q->type != GGML_TYPE_F32 || p->type != GGML_TYPE_F32 ||
+        q->nb[0] != sizeof(float) || p->nb[0] != sizeof(float) || q->ne[3] != 1 || p->ne[3] != 1) {
+        return nullptr;
+    }
+    const int64_t D = q->ne[0];
+    const int64_t T = q->ne[1];
+    // the generic matmul runs ggml_vec_dot_f32 (not tinyBLAS) as its 2T - 1 rows do not divide by 4, without
+    // leftover products for D a multiple of 64
+    if (D % 64 != 0 || D > 1024 || p->ne[0] != D || p->ne[1] != 2 * T - 1 || p->ne[2] != q->ne[2]) {
+        return nullptr;
+    }
+    static const bool ok = vec_dot_rows_match(128) && vec_dot_rows_match(64);
+    return ok ? rel_pos_scores_f16 : nullptr;
+#else
+    (void) q;
+    (void) p;
     return nullptr;
 #endif
 }
