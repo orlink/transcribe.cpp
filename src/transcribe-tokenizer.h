@@ -254,6 +254,10 @@ class Tokenizer {
     // absent token_type array.
     bool has_token_type(int id, int32_t type) const;
 
+    // Mergeable SentencePiece pieces with ids in [lo, hi) and the first
+    // unknown piece among them (-1 if none); see encode_sentencepiece_bpe.
+    void sentencepiece_pieces(int lo, int hi, std::unordered_map<std::string, int32_t> & pieces, int32_t & unk) const;
+
     // How decode() should reassemble token bytes. Set during load().
     //   SentencePiece    - U+2581 → ASCII space (unigram / bpe)
     //   Gpt2ByteUnicode  - invert GPT-2 byte-to-unicode per codepoint
@@ -295,6 +299,12 @@ class Tokenizer {
     // not appear in any Qwen byte-level BPE token, so collisions are
     // impossible.
     std::unordered_map<std::string, int32_t> merge_rank_;
+
+    // sentencepiece_pieces over the whole vocab, built at load for "unigram"
+    // / "bpe" models.
+    std::unordered_map<std::string, int32_t> sp_pieces_;
+    int32_t                                  sp_unk_          = -1;
+    bool                                     sp_pieces_ready_ = false;
 
     int unk_id_   = -1;
     int bos_id_   = -1;

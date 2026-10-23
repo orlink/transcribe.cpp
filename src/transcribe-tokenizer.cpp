@@ -488,6 +488,31 @@ transcribe_status encode_tiktoken_raw_bytes(const std::string &                 
 
 }  // namespace
 
+// Mergeable SentencePiece pieces with ids in [lo, hi); a lower id is a higher
+// merge priority (a SentencePiece BPE score is minus the merge rank, and
+// pieces are stored in rank order). Control / unknown pieces never match
+// text; unk is the first unknown piece in range, or -1.
+void Tokenizer::sentencepiece_pieces(int                                        lo,
+                                     int                                        hi,
+                                     std::unordered_map<std::string, int32_t> & pieces,
+                                     int32_t &                                  unk) const {
+    constexpr int32_t k_type_unknown = 2;
+    constexpr int32_t k_type_control = 3;
+    pieces.clear();
+    unk = -1;
+    for (int id = lo; id < hi; ++id) {
+        const std::string & piece = tokens_[static_cast<size_t>(id)];
+        const int32_t       type  = token_type_.empty() ? 1 : token_type_[static_cast<size_t>(id)];
+        if (type == k_type_unknown || piece == "<unk>") {
+            unk = unk < 0 ? id : unk;
+            continue;
+        }
+        if (type != k_type_control && !piece.empty()) {
+            pieces.emplace(piece, id);
+        }
+    }
+}
+
 transcribe_status Tokenizer::encode_sentencepiece_bpe(const std::string &    text,
                                                       std::vector<int32_t> & out_ids,
                                                       int                    lo,
@@ -563,24 +588,18 @@ transcribe_status Tokenizer::encode_sentencepiece_bpe(const std::string &    tex
         i = j;
     }
 
-    // Mergeable pieces in range; a lower id is a higher merge priority (a
-    // SentencePiece BPE score is minus the merge rank, and pieces are stored
-    // in rank order). Control / unknown pieces never match text.
-    constexpr int32_t                        k_type_unknown = 2;
-    constexpr int32_t                        k_type_control = 3;
-    std::unordered_map<std::string, int32_t> pieces;
-    int32_t                                  unk = -1;
-    for (int id = lo; id < hi; ++id) {
-        const std::string & piece = tokens_[static_cast<size_t>(id)];
-        const int32_t       type  = token_type_.empty() ? 1 : token_type_[static_cast<size_t>(id)];
-        if (type == k_type_unknown || piece == "<unk>") {
-            unk = unk < 0 ? id : unk;
-            continue;
-        }
-        if (type != k_type_control && !piece.empty()) {
-            pieces.emplace(piece, id);
-        }
+    // Mergeable pieces in range (see sentencepiece_pieces); the whole
+    // vocab's table is built once at load.
+    std::unordered_map<std::string, int32_t>         local;
+    int32_t                                          unk   = -1;
+    const std::unordered_map<std::string, int32_t> * table = &local;
+    if (lo == 0 && hi == n_vocab && sp_pieces_ready_) {
+        table = &sp_pieces_;
+        unk   = sp_unk_;
+    } else {
+        sentencepiece_pieces(lo, hi, local, unk);
     }
+    const std::unordered_map<std::string, int32_t> & pieces = *table;
     if (unk < 0) {
         unk = unk_id_;
     }
@@ -978,6 +997,15 @@ transcribe_status Tokenizer::load(const gguf_context * gguf) {
     }
     if (auto st = read_special("tokenizer.ggml.blank_token_id", blank_id_); st != TRANSCRIBE_OK) {
         return st;
+    }
+
+    // The whole vocab's SentencePiece table, so that encoding a prefix or a
+    // draft does not rebuild it on every run.
+    sp_pieces_ready_ = false;
+    sp_pieces_.clear();
+    if (model_ == "unigram" || model_ == "bpe") {
+        sentencepiece_pieces(0, static_cast<int>(tokens_.size()), sp_pieces_, sp_unk_);
+        sp_pieces_ready_ = true;
     }
 
     return TRANSCRIBE_OK;
