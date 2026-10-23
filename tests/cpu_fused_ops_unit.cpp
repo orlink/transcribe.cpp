@@ -329,6 +329,74 @@ void test_conv_2d_pw(ggml_backend_t cpu) {
     }
 }
 
+// the conv module of a conformer block after its gate: transpose, ggml_conv_2d_dw_direct along time (k = 9),
+// bias, batch norm (multiply, add), SiLU, transpose back
+void test_conv_1d_dw_bn_silu(ggml_backend_t cpu) {
+    using Getter           = ggml_custom_op_t (*)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
+                                                  const ggml_tensor *, const ggml_tensor *, int);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu));
+    const Getter       get =
+        reinterpret_cast<Getter>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_conv_1d_dw_bn_silu_op"));
+    if (get == nullptr) {
+        std::printf("conv_1d_dw_bn_silu: no kernel, skipped\n");
+        return;
+    }
+    std::mt19937                          rng(19);
+    std::uniform_real_distribution<float> us(0.5f, 2.0f);
+    for (const int64_t C : { 64, 1024 }) {
+        for (const int64_t T : { 5, 13, 64, 124, 133 }) {
+            for (const bool with_bias : { true, false }) {
+                const Input x{
+                    { C, T },
+                    wide_values(rng, C * T)
+                };
+                const Input w{
+                    { 9, 1, C },
+                    wide_values(rng, 9 * C)
+                };
+                Input scale{ { C }, std::vector<float>(C) };
+                for (float & v : scale.data) {
+                    v = us(rng);
+                }
+                const Input              shift{ { C }, wide_values(rng, C) };
+                const Input              bias{ { C }, wide_values(rng, C) };
+                const std::vector<float> ref = run_graph(
+                    cpu, { x, w, scale, shift, bias }, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+                        ggml_tensor * y = ggml_cont(ctx, ggml_permute(ctx, t[0], 1, 0, 2, 3));
+                        ggml_tensor * k = ggml_reshape_4d(ctx, t[1], 9, 1, 1, C);
+                        y = ggml_conv_2d_dw_direct(ctx, k, ggml_reshape_4d(ctx, y, T, 1, C, 1), 1, 1, 4, 0, 1, 1);
+                        y = ggml_reshape_2d(ctx, y, T, C);
+                        if (with_bias) {
+                            y = ggml_add(ctx, y, ggml_reshape_2d(ctx, t[4], 1, C));
+                        }
+                        y = ggml_mul(ctx, y, ggml_reshape_4d(ctx, t[2], 1, C, 1, 1));
+                        y = ggml_add(ctx, y, ggml_reshape_4d(ctx, t[3], 1, C, 1, 1));
+                        y = ggml_silu(ctx, y);
+                        return ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));
+                    });
+                ggml_custom_op_t         op  = nullptr;
+                const std::vector<float> got = run_graph(
+                    cpu, { x, w, scale, shift, bias }, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+                        op = get(t[0], t[1], with_bias ? t[4] : nullptr, t[2], t[3], 4);
+                        if (op == nullptr) {
+                            return ggml_cont(ctx, t[0]);
+                        }
+                        ggml_tensor * args[5] = { t[0], t[1], t[2], t[3], t[4] };
+                        return ggml_custom_4d(ctx, GGML_TYPE_F32, C, T, 1, 1, args, with_bias ? 5 : 4, op,
+                                              GGML_N_TASKS_MAX, reinterpret_cast<void *>(static_cast<intptr_t>(4)));
+                    });
+                CHECK(op != nullptr);
+                const int64_t bad = count_differ(ref, got);
+                if (bad != 0) {
+                    std::fprintf(stderr, "conv_1d_dw_bn_silu C=%lld T=%lld bias=%d: %lld differ\n", (long long) C,
+                                 (long long) T, (int) with_bias, (long long) bad);
+                }
+                CHECK(bad == 0);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -343,6 +411,7 @@ int main() {
     test_conv_2d_s2_c1(cpu);
     test_conv_2d_dw_s2(cpu);
     test_conv_2d_pw(cpu);
+    test_conv_1d_dw_bn_silu(cpu);
 
     ggml_backend_free(cpu);
     if (g_failures != 0) {

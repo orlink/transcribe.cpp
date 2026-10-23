@@ -720,6 +720,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_conv_2d_pw_bias_relu_op") == 0) {
         return (void *)ggml_cpu_conv_2d_pw_bias_relu_op;
     }
+    if (strcmp(name, "ggml_backend_cpu_conv_1d_dw_bn_silu_op") == 0) {
+        return (void *)ggml_cpu_conv_1d_dw_bn_silu_op;
+    }
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
     if (strcmp(name, "ggml_backend_cpu_amx_set_q8_0_grouped") == 0) {
         return (void *)ggml_backend_amx_set_q8_0_grouped;

@@ -3,6 +3,7 @@
 #include "fused-ops.h"
 
 #include "ggml-cpu-impl.h"
+#include "ops.h"
 #include "simd-mappings.h"
 #include "vec.h"
 
@@ -335,6 +336,156 @@ void conv_2d_dw_s2_bias(ggml_tensor * dst, int ith, int nth, void * userdata) {
     }
 }
 
+#if defined(__AVX512DQ__)
+
+// The conv module of a conformer block after its gate, in the generic graph: transpose [C, T] -> [T, C],
+// ggml_conv_2d_dw_direct along T (K = 9), bias add, BN as a multiply and an add, SiLU, transpose back. Its
+// CONV_2D_DW op sums each output's valid taps in tap order; GCC's AVX-512 build multiplies taps 0-7 in one vector
+// (invalid taps as zero products) and adds them one by one to zero, then adds tap 8 with an FMA. SiLU runs
+// ggml_vec_silu_f32 over each channel's T values: ggml_v_silu for the first T & ~15, x / (1 + expf(-x)) for the
+// rest. Here 16 channels share a vector, for one time step at a time, with the same operations per value.
+constexpr int k_dw_taps = 9;
+
+// tap sum of one output, as CONV_2D_DW computes it (valid taps j, at times t + j - pad)
+inline float dw9_ref(const float * knl, const float * src, int64_t T, int64_t t, int pad) {
+    __m128 s = _mm_setzero_ps();
+    for (int j = 0; j < 8; ++j) {
+        const int64_t st = t + j - pad;
+        if (st >= 0 && st < T) {
+            s = _mm_add_ss(s, _mm_mul_round_ss(_mm_set_ss(knl[j]), _mm_set_ss(src[st]), _MM_FROUND_CUR_DIRECTION));
+        }
+    }
+    const int64_t st = t + 8 - pad;
+    if (st >= 0 && st < T) {
+        s = _mm_fmadd_ss(_mm_set_ss(knl[8]), _mm_set_ss(src[st]), s);
+    }
+    return _mm_cvtss_f32(s);
+}
+
+// Whether the CPU backend's CONV_2D_DW sums as dw9_ref, on random values spanning many magnitudes, with every
+// output near both ends
+bool conv_2d_dw_matches(int pad) {
+    constexpr int64_t T = 40;
+    constexpr int64_t C = 4;
+    std::mt19937                          rng(9);
+    std::normal_distribution<float>       nd(0.0f, 1.0f);
+    std::uniform_real_distribution<float> ue(-4.0f, 4.0f);
+    std::vector<float>                    src(T * C), knl(k_dw_taps * C), out(T * C);
+    for (float & v : src) {
+        v = nd(rng) * powf(10.0f, ue(rng));
+    }
+    for (float & v : knl) {
+        v = nd(rng) * powf(10.0f, ue(rng));
+    }
+    ggml_tensor ts{};
+    ggml_tensor tk{};
+    ggml_tensor td{};
+    ts.type  = GGML_TYPE_F32;
+    ts.ne[0] = T;
+    ts.ne[1] = 1;
+    ts.ne[2] = C;
+    ts.ne[3] = 1;
+    tk.type  = GGML_TYPE_F32;
+    tk.ne[0] = k_dw_taps;
+    tk.ne[1] = 1;
+    tk.ne[2] = 1;
+    tk.ne[3] = C;
+    td.type  = GGML_TYPE_F32;
+    td.ne[0] = T + 2 * pad - k_dw_taps + 1;
+    td.ne[1] = 1;
+    td.ne[2] = C;
+    td.ne[3] = 1;
+    for (ggml_tensor * t : { &ts, &tk, &td }) {
+        t->nb[0] = sizeof(float);
+        for (int i = 1; i < 4; ++i) {
+            t->nb[i] = t->nb[i - 1] * t->ne[i - 1];
+        }
+    }
+    ts.data      = src.data();
+    tk.data      = knl.data();
+    td.data      = out.data();
+    td.op        = GGML_OP_CONV_2D_DW;
+    td.src[0]    = &tk;
+    td.src[1]    = &ts;
+    const int32_t op_params[6] = { 1, 1, pad, 0, 1, 1 };
+    memcpy(td.op_params, op_params, sizeof(op_params));
+    ggml_compute_params params{};
+    params.ith = 0;
+    params.nth = 1;
+    ggml_compute_forward_conv_2d_dw(&params, &td);
+    for (int64_t c = 0; c < C; ++c) {
+        for (int64_t t = 0; t < td.ne[0]; ++t) {
+            const float ref = out[c * td.ne[0] + t];
+            const float got = dw9_ref(knl.data() + c * k_dw_taps, src.data() + c * T, T, t, pad);
+            if (memcmp(&ref, &got, sizeof(float)) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void conv_1d_dw_bn_silu(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const ggml_tensor * x     = dst->src[0];
+    const ggml_tensor * w     = dst->src[1];
+    const ggml_tensor * scale = dst->src[2];
+    const ggml_tensor * shift = dst->src[3];
+    const ggml_tensor * b     = dst->src[4];
+    const int           pad   = (int) (intptr_t) userdata;
+
+    const int64_t C   = x->ne[0];
+    const int64_t T   = x->ne[1];
+    const int64_t T16 = T & ~(int64_t) 15;  // SiLU's vector part along each channel's row
+
+    const float * xd = (const float *) x->data;
+    const float * wd = (const float *) w->data;
+    const float * sd = (const float *) scale->data;
+    const float * hd = (const float *) shift->data;
+    const float * bd = b != nullptr ? (const float *) b->data : nullptr;
+    float *       yd = (float *) dst->data;
+
+    // the kernel by tap, [9][C]
+    static thread_local std::vector<float> kt;
+    kt.resize(k_dw_taps * C);
+    for (int64_t c = 0; c < C; ++c) {
+        for (int j = 0; j < k_dw_taps; ++j) {
+            kt[j * C + c] = wd[c * k_dw_taps + j];
+        }
+    }
+
+    const int64_t t0  = T * ith / nth;
+    const int64_t t1  = T * (ith + 1) / nth;
+    const __m512  one = _mm512_set1_ps(1.0f);
+    for (int64_t t = t0; t < t1; ++t) {
+        float * out = yd + t * C;
+        for (int64_t c = 0; c < C; c += 16) {
+            __m512 s = _mm512_setzero_ps();
+            for (int j = 0; j < 8; ++j) {
+                const int64_t st = t + j - pad;
+                if (st >= 0 && st < T) {
+                    s = _mm512_add_ps(s, mul_unfused(_mm512_loadu_ps(kt.data() + j * C + c), _mm512_loadu_ps(xd + st * C + c)));
+                }
+            }
+            const int64_t st = t + 8 - pad;
+            if (st >= 0 && st < T) {
+                s = _mm512_fmadd_ps(_mm512_loadu_ps(kt.data() + 8 * C + c), _mm512_loadu_ps(xd + st * C + c), s);
+            }
+            if (bd != nullptr) {
+                s = _mm512_add_ps(s, _mm512_loadu_ps(bd + c));
+            }
+            s = _mm512_add_ps(mul_unfused(s, _mm512_loadu_ps(sd + c)), _mm512_loadu_ps(hd + c));
+            if (t < T16) {
+                s = ggml_v_silu(s);
+            } else {
+                s = _mm512_div_ps(s, _mm512_add_ps(one, ggml_v_expf_f64(_mm512_sub_ps(_mm512_setzero_ps(), s))));
+            }
+            _mm512_storeu_ps(out + c, s);
+        }
+    }
+}
+
+#endif  // __AVX512DQ__
+
 #endif  // GGML_CONV_FUSED_AVX512
 
 }  // namespace
@@ -388,6 +539,37 @@ extern "C" ggml_custom_op_t ggml_cpu_conv_2d_pw_bias_relu_op(const ggml_tensor *
     (void) x;
     (void) w;
     (void) b;
+    (void) pad;
+    return nullptr;
+#endif
+}
+
+extern "C" ggml_custom_op_t ggml_cpu_conv_1d_dw_bn_silu_op(const ggml_tensor * x, const ggml_tensor * w,
+                                                           const ggml_tensor * b, const ggml_tensor * scale,
+                                                           const ggml_tensor * shift, int pad) {
+#if defined(GGML_CONV_FUSED_AVX512) && defined(__AVX512DQ__)
+    if (x == nullptr || w == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 ||
+        x->ne[3] != 1 || x->ne[0] % 16 != 0) {
+        return nullptr;
+    }
+    const int64_t C = x->ne[0];
+    if (w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || ggml_nelements(w) != k_dw_taps * C ||
+        w->ne[0] != k_dw_taps || !is_f32_vector(scale, C) || !is_f32_vector(shift, C) ||
+        (b != nullptr && !is_f32_vector(b, C))) {
+        return nullptr;
+    }
+    // output length equal to the input's: symmetric padding (K - 1) / 2
+    if (pad != (k_dw_taps - 1) / 2) {
+        return nullptr;
+    }
+    static const bool ok = conv_2d_dw_matches((k_dw_taps - 1) / 2);
+    return ok ? conv_1d_dw_bn_silu : nullptr;
+#else
+    (void) x;
+    (void) w;
+    (void) b;
+    (void) scale;
+    (void) shift;
     (void) pad;
     return nullptr;
 #endif

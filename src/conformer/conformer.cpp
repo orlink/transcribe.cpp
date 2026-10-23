@@ -339,6 +339,44 @@ bool detect_direct_pw(const char * backend) {
     return resolve_conv_direct("TRANSCRIBE_CONV_DIRECT_PW", "TRANSCRIBE_CONV_NO_DIRECT_PW", backend_default);
 }
 
+namespace {
+
+// Pointwise conv 2 of the conv module as a direct mul_mat in [d_model, T] layout, plus its bias. Force F32
+// accumulation for F16 weights (see mul_mat_f32acc in causal_lm.cpp for the CUDA COMPUTE_16F rationale).
+ggml_tensor * conv_pw2_direct(ggml_context * ctx, ggml_tensor * x, const BlockView & b, int64_t d_model) {
+    ggml_tensor * pw2 = ggml_reshape_2d(ctx, b.conv_pw2_w, d_model, d_model);
+    x                 = ggml_mul_mat(ctx, pw2, x);
+    if (b.conv_pw2_w->type == GGML_TYPE_F16) {
+        ggml_prec_set_acc(x, GGML_PREC_F32);
+    }
+    if (b.conv_pw2_b != nullptr) {
+        x = ggml_add(ctx, x, b.conv_pw2_b);
+    }
+    return x;
+}
+
+// The conv module from the depthwise conv through SiLU as one CPU direct kernel on the gate's [d_model, T]
+// output (ggml-cpu/fused-ops.h), or null where it does not apply or the backend has no kernel.
+ggml_tensor * cpu_fused_conv_tail(ggml_context * ctx, ggml_tensor * x, const BlockView & b, int pad) {
+    using Getter           = ggml_custom_op_t (*)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *,
+                                                  const ggml_tensor *, const ggml_tensor *, int);
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+    const Getter       get =
+        reg != nullptr ?
+            reinterpret_cast<Getter>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_conv_1d_dw_bn_silu_op")) :
+            nullptr;
+    ggml_custom_op_t op =
+        get != nullptr ? get(x, b.conv_dw_w, b.conv_dw_b, b.conv_bn_fused_scale, b.conv_bn_fused_bias, pad) : nullptr;
+    if (op == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * args[5] = { x, b.conv_dw_w, b.conv_bn_fused_scale, b.conv_bn_fused_bias, b.conv_dw_b };
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], 1, 1, args, b.conv_dw_b != nullptr ? 5 : 4, op,
+                          GGML_N_TASKS_MAX, reinterpret_cast<void *>(static_cast<intptr_t>(pad)));
+}
+
+}  // namespace
+
 // Conv module (pointwise -> GLU -> depthwise -> BN/LN -> SiLU -> pointwise).
 // Operates on the post-LayerNorm activation (LN applied by the caller).
 // Pointwise convs (k=1) are direct mul_mats in [d_model, T] layout by
@@ -398,6 +436,17 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
             x                   = ggml_mul(ctx, gate, ggml_sigmoid(ctx, value));
         }
         // x ne = [d_model, T, B]
+
+        // On CPU, the depthwise conv through SiLU in one kernel in this layout, then pointwise conv 2.
+        if (policy.cpu_fused_ops && policy.direct_dw_in_block && B == 1 && pad_left == pad_right &&
+            params.conv_pad_mask == nullptr && params.streaming_time_in == nullptr &&
+            params.conv_norm_type == BlockParams::ConvNormType::BatchNorm && b.conv_bn_fused_scale != nullptr &&
+            b.conv_bn_fused_bias != nullptr) {
+            ggml_tensor * tail = cpu_fused_conv_tail(ctx, x, b, pad_left);
+            if (tail != nullptr) {
+                return conv_pw2_direct(ctx, tail, b, d_model);
+            }
+        }
 
         // Transpose for depthwise conv: [d_model, T, B] -> [T, d_model, B].
         x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
@@ -524,19 +573,9 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
     x = ggml_silu(ctx, x);
 
     if (direct_pw) {
-        // Transpose back: [T, d_model] -> [d_model, T].
+        // Transpose back: [T, d_model] -> [d_model, T], then pointwise conv 2.
         x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
-
-        // Pointwise conv 2 as direct mul_mat in [d_model, T] layout. See
-        // the pw1 comment above for the F16 / CUDA COMPUTE_16F rationale.
-        ggml_tensor * pw2 = ggml_reshape_2d(ctx, b.conv_pw2_w, d_model, d_model);
-        x                 = ggml_mul_mat(ctx, pw2, x);
-        if (b.conv_pw2_w->type == GGML_TYPE_F16) {
-            ggml_prec_set_acc(x, GGML_PREC_F32);
-        }
-        if (b.conv_pw2_b != nullptr) {
-            x = ggml_add(ctx, x, b.conv_pw2_b);
-        }
+        x = conv_pw2_direct(ctx, x, b, d_model);
     } else {
         x = conv_1d_f32(ctx, b.conv_pw2_w, x, /*s=*/1, /*p=*/0, /*d=*/1);
         if (b.conv_pw2_b != nullptr) {

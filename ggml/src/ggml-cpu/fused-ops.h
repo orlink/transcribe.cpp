@@ -29,6 +29,14 @@ ggml_custom_op_t ggml_cpu_conv_2d_dw_s2_bias_op(const struct ggml_tensor * x, co
 ggml_custom_op_t ggml_cpu_conv_2d_pw_bias_relu_op(const struct ggml_tensor * x, const struct ggml_tensor * w,
                                                   const struct ggml_tensor * b, int pad);
 
+// A conformer conv module after its gate: x [C, T, 1, 1] f32 (channels innermost), a depthwise conv along T with
+// w [9, 1, C] f32 and padding 4, plus b [C] f32 (may be NULL), times scale [C], plus shift [C] (batch norm),
+// then SiLU: [C, T, 1, 1]. Reproduces the transpose to [T, C], ggml_conv_2d_dw_direct, ggml_add, ggml_mul,
+// ggml_add, ggml_silu and the transpose back. Custom op arguments: x, w, scale, shift, and b if not NULL.
+ggml_custom_op_t ggml_cpu_conv_1d_dw_bn_silu_op(const struct ggml_tensor * x, const struct ggml_tensor * w,
+                                                const struct ggml_tensor * b, const struct ggml_tensor * scale,
+                                                const struct ggml_tensor * shift, int pad);
+
 #ifdef __cplusplus
 }
 #endif
