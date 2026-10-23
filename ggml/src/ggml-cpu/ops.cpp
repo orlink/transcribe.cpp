@@ -4109,20 +4109,35 @@ void ggml_compute_forward_norm_mul_add_fused(
 
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
-            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
-                const float * xf = (const float *) ((const char *) src0->data + i01*src0->nb[1] + i02*src0->nb[2] + i03*src0->nb[3]);
-                float       * yf = (float *) ((char *) dst_add->data + i01*dst_add->nb[1] + i02*dst_add->nb[2] + i03*dst_add->nb[3]);
+            // this thread's rows ith, ith + nth, ..., their sums 16 rows at a time (the last group padded with
+            // repeats of its first row)
+            for (int64_t i0 = ith; i0 < ne01; i0 += 16*nth) {
+                const int64_t n_rows = MIN(16, (ne01 - i0 + nth - 1)/nth);
+                const float * xs[16];
+                float         sums[16];
+                for (int k = 0; k < 16; ++k) {
+                    const int64_t i01 = i0 + (k < n_rows ? k : 0)*nth;
+                    xs[k] = (const float *) ((const char *) src0->data + i01*src0->nb[1] + i02*src0->nb[2] + i03*src0->nb[3]);
+                }
+                if (n_rows > 1) {
+                    ggml_vec_sum_f32_x16(ne00, sums, xs);
+                } else {
+                    ggml_vec_sum_f32(ne00, &sums[0], xs[0]);
+                }
+                for (int k = 0; k < n_rows; ++k) {
+                    const int64_t i01 = i0 + k*nth;
+                    const float * xf  = xs[k];
+                    float       * yf  = (float *) ((char *) dst_add->data + i01*dst_add->nb[1] + i02*dst_add->nb[2] + i03*dst_add->nb[3]);
 
-                float sum = 0.0;
-                ggml_vec_sum_f32(ne00, &sum, xf);
-                const float mean = sum/ne00;
+                    const float mean = sums[k]/ne00;
 
-                const float variance = ggml_vec_cvar_f32(ne00, yf, xf, mean);
-                const float scale    = 1.0f/sqrtf(variance + eps);
-                ggml_vec_scale_f32(ne00, yf, scale);
+                    const float variance = ggml_vec_cvar_f32(ne00, yf, xf, mean);
+                    const float scale    = 1.0f/sqrtf(variance + eps);
+                    ggml_vec_scale_f32(ne00, yf, scale);
 
-                ggml_vec_mul_f32(ne00, yf, yf, wf);
-                ggml_vec_add_f32(ne00, yf, yf, bf);
+                    ggml_vec_mul_f32(ne00, yf, yf, wf);
+                    ggml_vec_add_f32(ne00, yf, yf, bf);
+                }
             }
         }
     }

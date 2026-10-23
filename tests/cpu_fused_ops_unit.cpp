@@ -8,6 +8,7 @@
 //   - The direct conv kernels of ggml-cpu/fused-ops.h (custom ops from the CPU backend's proc address): equal
 //     bit for bit to the generic ops they replace, for inputs spanning six orders of magnitude, several shapes
 //     and paddings. Skipped where the backend returns no kernel.
+//   - Layer norm fused by the CPU backend (NORM + MUL + ADD) against the unfused nodes, for 1-133 rows.
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -397,6 +398,38 @@ void test_conv_1d_dw_bn_silu(ggml_backend_t cpu) {
     }
 }
 
+// layer norm: NORM + MUL + ADD fused by the CPU backend (row sums 16 rows at a time) against the same nodes
+// unfused (the NORM marked as an output, which keeps the backend from fusing it)
+void test_norm_mul_add(ggml_backend_t cpu) {
+    std::mt19937 rng(23);
+    for (const int64_t n : { 1024, 1003 }) {
+        for (const int64_t rows : { 1, 5, 31, 64, 124, 133 }) {
+            const Input x{
+                { n, rows },
+                wide_values(rng, n * rows)
+            };
+            const Input        w{ { n }, wide_values(rng, n) };
+            const Input        b{ { n }, wide_values(rng, n) };
+            std::vector<float> res[2];
+            for (int fused = 0; fused < 2; ++fused) {
+                res[fused] = run_graph(cpu, { x, w, b }, [&](ggml_context * ctx, std::vector<ggml_tensor *> & t) {
+                    ggml_tensor * y = ggml_norm(ctx, t[0], 1e-5f);
+                    if (!fused) {
+                        ggml_set_output(y);
+                    }
+                    return ggml_add(ctx, ggml_mul(ctx, y, t[1]), t[2]);
+                });
+            }
+            const int64_t bad = count_differ(res[0], res[1]);
+            if (bad != 0) {
+                std::fprintf(stderr, "norm_mul_add n=%lld rows=%lld: %lld differ\n", (long long) n, (long long) rows,
+                             (long long) bad);
+            }
+            CHECK(bad == 0);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -412,6 +445,7 @@ int main() {
     test_conv_2d_dw_s2(cpu);
     test_conv_2d_pw(cpu);
     test_conv_1d_dw_bn_silu(cpu);
+    test_norm_mul_add(cpu);
 
     ggml_backend_free(cpu);
     if (g_failures != 0) {

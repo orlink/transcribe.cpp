@@ -1654,6 +1654,56 @@ inline static void ggml_vec_sum_f32(const int n, float * s, const float * x) {
 #endif
 }
 
+// ggml_vec_sum_f32 of 16 rows at once. Each double lane adds its row's values in order, as the scalar loop does,
+// so every sum is the same; the 16 latency-bound chains of additions run side by side.
+inline static void ggml_vec_sum_f32_x16(const int n, float * s, const float * const * x) {
+#if defined(__AVX512F__) && !defined(GGML_USE_ACCELERATE)
+    __m512d acc[2] = { _mm512_setzero_pd(), _mm512_setzero_pd() };
+    int     i      = 0;
+    for (; i + 8 <= n; i += 8) {
+        for (int h = 0; h < 2; ++h) {
+            // transpose the 8 x 8 block of rows 8h .. 8h + 7, columns i .. i + 7
+            __m256 r[8];
+            for (int k = 0; k < 8; ++k) {
+                r[k] = _mm256_loadu_ps(x[8 * h + k] + i);
+            }
+            __m256 t[8];
+            for (int k = 0; k < 4; ++k) {
+                t[2 * k]     = _mm256_unpacklo_ps(r[2 * k], r[2 * k + 1]);
+                t[2 * k + 1] = _mm256_unpackhi_ps(r[2 * k], r[2 * k + 1]);
+            }
+            __m256 u[8];
+            for (int k = 0; k < 2; ++k) {
+                u[4 * k + 0] = _mm256_shuffle_ps(t[4 * k + 0], t[4 * k + 2], _MM_SHUFFLE(1, 0, 1, 0));
+                u[4 * k + 1] = _mm256_shuffle_ps(t[4 * k + 0], t[4 * k + 2], _MM_SHUFFLE(3, 2, 3, 2));
+                u[4 * k + 2] = _mm256_shuffle_ps(t[4 * k + 1], t[4 * k + 3], _MM_SHUFFLE(1, 0, 1, 0));
+                u[4 * k + 3] = _mm256_shuffle_ps(t[4 * k + 1], t[4 * k + 3], _MM_SHUFFLE(3, 2, 3, 2));
+            }
+            for (int k = 0; k < 4; ++k) {
+                r[k]     = _mm256_permute2f128_ps(u[k], u[4 + k], 0x20);  // column k
+                r[4 + k] = _mm256_permute2f128_ps(u[k], u[4 + k], 0x31);  // column 4 + k
+            }
+            for (int k = 0; k < 8; ++k) {
+                acc[h] = _mm512_add_pd(acc[h], _mm512_cvtps_pd(r[k]));
+            }
+        }
+    }
+    for (; i < n; ++i) {
+        for (int h = 0; h < 2; ++h) {
+            const __m256 c = _mm256_setr_ps(x[8 * h][i], x[8 * h + 1][i], x[8 * h + 2][i], x[8 * h + 3][i],
+                                            x[8 * h + 4][i], x[8 * h + 5][i], x[8 * h + 6][i], x[8 * h + 7][i]);
+            acc[h]         = _mm512_add_pd(acc[h], _mm512_cvtps_pd(c));
+        }
+    }
+    _mm256_storeu_ps(s, _mm512_cvtpd_ps(acc[0]));
+    _mm256_storeu_ps(s + 8, _mm512_cvtpd_ps(acc[1]));
+#else
+    for (int k = 0; k < 16; ++k) {
+        ggml_vec_sum_f32(n, s + k, x[k]);
+    }
+#endif
+}
+
 inline static void ggml_vec_cumsum_f32(const int n, float * y, const float * x) {
     for (int i = 0; i < n; ++i) {
         if (i == 0) {
